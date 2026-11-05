@@ -463,7 +463,7 @@ def _to_device(pack, device):
 
 
 def _single_sample_pack(n_text: int, frames: int, seed: int, domain_id: int = 0, n_act: int = 2):
-    """One sample in the layout `pack_one` produces: ``[text | vision patches | action]``."""
+    """A synthetic ``[text | vision patches | action]`` sample with unit-spaced temporal coordinates."""
     generator = torch.Generator().manual_seed(seed)
     h_patches = LATENT_HW // LATENT_PATCH
     w_patches = LATENT_HW // LATENT_PATCH
@@ -471,10 +471,22 @@ def _single_sample_pack(n_text: int, frames: int, seed: int, domain_id: int = 0,
     sequence_length = n_text + n_vis + n_act
     vision_indexes = torch.arange(n_text, n_text + n_vis)
     action_indexes = torch.arange(n_text + n_vis, sequence_length)
+
+    text_positions = torch.arange(n_text).expand(3, -1)
+    frame_positions = torch.arange(frames).repeat_interleave(h_patches * w_patches) + n_text
+    row_positions = torch.arange(h_patches).repeat_interleave(w_patches).repeat(frames)
+    column_positions = torch.arange(w_patches).repeat(h_patches * frames)
+    vision_positions = torch.stack((frame_positions, row_positions, column_positions))
+
+    action_time_positions = torch.arange(n_act) + n_text + frames
+    action_spatial_positions = torch.zeros(n_act, dtype=torch.long)
+    action_positions = torch.stack((action_time_positions, action_spatial_positions, action_spatial_positions))
+    position_ids = torch.cat((text_positions, vision_positions, action_positions), dim=1)
+
     return dict(
         input_ids=torch.randint(0, 64, (n_text,), generator=generator),
         text_indexes=torch.arange(n_text),
-        position_ids=torch.arange(sequence_length).unsqueeze(0).repeat(3, 1),
+        position_ids=position_ids,
         und_len=n_text,
         sequence_length=sequence_length,
         vision_tokens=[torch.randn(1, LATENT_CHANNEL, frames, LATENT_HW, LATENT_HW, generator=generator)],
@@ -492,6 +504,32 @@ def _single_sample_pack(n_text: int, frames: int, seed: int, domain_id: int = 0,
         action_domain_ids=[torch.tensor(domain_id)],
     )
 
+
+def test_single_sample_pack_uses_three_axis_mrope_positions():
+    n_text, frames, n_act = 3, 2, 2
+    pack = _single_sample_pack(n_text=n_text, frames=frames, seed=1, n_act=n_act)
+    h_patches, w_patches = LATENT_HW // LATENT_PATCH, LATENT_HW // LATENT_PATCH
+
+    text_positions = torch.arange(n_text).expand(3, -1)
+    torch.testing.assert_close(pack["position_ids"][:, :n_text], text_positions)
+
+    vision_positions = pack["position_ids"][:, pack["vision_sequence_indexes"]]
+    patches_per_frame = h_patches * w_patches
+    expected_frame_positions = torch.arange(frames).repeat_interleave(patches_per_frame) + n_text
+    expected_row_positions = torch.arange(h_patches).repeat_interleave(w_patches).repeat(frames)
+    expected_column_positions = torch.arange(w_patches).repeat(h_patches * frames)
+    torch.testing.assert_close(
+        vision_positions,
+        torch.stack((expected_frame_positions, expected_row_positions, expected_column_positions)),
+    )
+
+    action_positions = pack["position_ids"][:, pack["action_sequence_indexes"]]
+    expected_action_times = torch.arange(n_act) + n_text + frames
+    expected_action_spatial_positions = torch.zeros(n_act, dtype=torch.long)
+    torch.testing.assert_close(
+        action_positions,
+        torch.stack((expected_action_times, expected_action_spatial_positions, expected_action_spatial_positions)),
+    )
 
 def _merge_single_sample_packs(packs):
     """The documented multi-sample layout: one global AR block, then one global DM block.
