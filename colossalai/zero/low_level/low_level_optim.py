@@ -572,7 +572,8 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
                     grad = grads[grad_index]
                     # no need to copy fp32 grad if master_weights is False
                     if self._master_weights:
-                        grad = grad.to(master_param.dtype).to(master_param.device)
+                        # One cast+copy instead of two; the chained form issued two kernels per shard.
+                        grad = grad.to(device=master_param.device, dtype=master_param.dtype)
                     master_param.grad = grad
                     grad_partition_groups.append(grad)
                     real_master_params[group_id].append(master_param)
@@ -606,7 +607,8 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
             master_working_param = self.optim.param_groups[group_id]["params"]
             for idx, master_param in enumerate(master_working_param):
                 working_param = real_working_params[group_id][idx]
-                param_to_gather = master_param.to(device).to(self._dtype)
+                # One cast+copy instead of two per parameter per step (same as the grad path above).
+                param_to_gather = master_param.to(device=device, dtype=self._dtype)
                 pg = self.param_to_pg[working_param]
                 padded_working_param = self._working_param_to_padded_working_param[working_param]
                 if self._overlap_allgather:
@@ -694,8 +696,28 @@ class LowLevelZeroOptimizer(OptimizerWrapper):
             if clip > 1:
                 div_scale = clip * div_scale
 
+        if not grad_groups_flat:
+            return
+        scale = 1.0 / div_scale
+        # A per-tensor loop issues one launch per shard (hundreds per step under ZeRO-2);
+        # the foreach form folds them into a single multi-tensor kernel. The math is unchanged.
+        if len(grad_groups_flat) == 1:
+            grad_groups_flat[0].data.mul_(scale)
+            return
+        same_placement = all(
+            grad.dtype == grad_groups_flat[0].dtype and grad.device == grad_groups_flat[0].device
+            for grad in grad_groups_flat
+        )
+        if same_placement:
+            try:
+                torch._foreach_mul_([grad.data for grad in grad_groups_flat], scale)
+                return
+            except (RuntimeError, NotImplementedError, TypeError):
+                # Dispatch fails before any kernel runs, so no tensor is half-scaled; the loop below covers
+                # backends without a foreach kernel.
+                pass
         for grad in grad_groups_flat:
-            grad.data.mul_(1.0 / div_scale)
+            grad.data.mul_(scale)
 
     ############################
     # Gradient Synchronization #

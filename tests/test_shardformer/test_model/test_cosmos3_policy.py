@@ -19,7 +19,11 @@ import torch.nn.functional as F
 
 from colossalai.shardformer import ShardConfig, ShardFormer
 from colossalai.shardformer.layer import Linear1D_Col, Linear1D_Row, TwoWayPackedMeta
-from colossalai.shardformer.modeling.cosmos3 import ColossalTwoWayAttnProcessor, set_cosmos3_packed_meta
+from colossalai.shardformer.modeling.cosmos3 import (
+    ColossalTwoWayAttnProcessor,
+    clear_cosmos3_packed_meta,
+    set_cosmos3_packed_meta,
+)
 from colossalai.shardformer.modeling.cosmos_mot import layout_from_split_lengths
 from colossalai.shardformer.policies.base_policy import ModulePolicyDescription
 from colossalai.shardformer.policies.cosmos3 import Cosmos3OmniPolicy
@@ -437,8 +441,12 @@ def _test_device():
     """Run the real-model checks on the accelerator when one is present.
 
     diffusers' ``RMSNorm`` calls the Ascend fusion op whenever ``torch_npu`` is installed, and that op has no CPU
-    kernel, so on an NPU host these checks have to run on the device even though the model is tiny.
+    kernel, so on an NPU host these checks have to run on the device even though the model is tiny. A CUDA host must
+    be detected here too: otherwise a GPU job would silently exercise the CPU fallback and prove nothing about the
+    device path.
     """
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
     try:
         # Imported for its side effect: `torch.npu` only exists once torch_npu has been imported.
         importlib.import_module("torch_npu")
@@ -530,6 +538,7 @@ def test_single_sample_pack_uses_three_axis_mrope_positions():
         action_positions,
         torch.stack((expected_action_times, expected_action_spatial_positions, expected_action_spatial_positions)),
     )
+
 
 def _merge_single_sample_packs(packs):
     """The documented multi-sample layout: one global AR block, then one global DM block.
@@ -629,3 +638,119 @@ def test_real_model_multi_sample_pack_matches_two_single_sample_runs():
     torch.testing.assert_close(packed.sample[1], alone_b.sample[0], atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(packed.action[0], alone_a.action[0], atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(packed.action[1], alone_b.action[0], atol=1e-4, rtol=1e-4)
+
+
+def test_packed_metadata_helper_is_strict_and_can_clear():
+    model = Cosmos3OmniTransformer(num_layers=3)
+    meta = TwoWayPackedMeta([4, 3], [2, 5])
+
+    assert set_cosmos3_packed_meta(model, meta, strict=True) == 3
+    for layer in model.layers:
+        assert layer.processor.packed_meta is meta
+
+    assert clear_cosmos3_packed_meta(model, strict=True) == 3
+    for layer in model.layers:
+        assert layer.processor.packed_meta is None
+
+    with pytest.raises(RuntimeError, match="No Cosmos 3 attention processor"):
+        set_cosmos3_packed_meta(torch.nn.Linear(2, 2), meta, strict=True)
+
+
+def test_same_totals_with_different_boundaries_produce_different_attention():
+    attn = Cosmos3PackedMoTAttention().double()
+    und_seq, gen_seq, rotary_emb = _inputs([4, 3], [2, 5])
+    split_across_two_samples = ColossalTwoWayAttnProcessor(packed_meta=TwoWayPackedMeta([4, 3], [2, 5]))
+    one_sample = ColossalTwoWayAttnProcessor(packed_meta=TwoWayPackedMeta([7], [7]))
+
+    split_output = split_across_two_samples(attn, und_seq, gen_seq, rotary_emb)
+    one_output = one_sample(attn, und_seq, gen_seq, rotary_emb)
+
+    # The processor cannot infer the boundary from the token totals, so both are accepted. The training entry point
+    # must bind the metadata that belongs to the pack; this assertion documents why a total-only check is not enough.
+    assert not torch.allclose(split_output[0], one_output[0])
+    assert not torch.allclose(split_output[1], one_output[1])
+
+
+class _CheckpointedCosmos3OmniTransformer(Cosmos3OmniTransformer):
+    """Stand-in that wraps every decoder layer in non-reentrant activation checkpointing."""
+
+    def __init__(self, num_layers: int = 2) -> None:
+        super().__init__(num_layers=num_layers)
+        self.gradient_checkpointing = True
+
+    def forward(self, und_seq, gen_seq, rotary_emb):
+        for layer in self.layers:
+            if self.gradient_checkpointing and torch.is_grad_enabled():
+                und_seq, gen_seq = torch.utils.checkpoint.checkpoint(
+                    layer, und_seq, gen_seq, rotary_emb, use_reentrant=False
+                )
+            else:
+                und_seq, gen_seq = layer(und_seq, gen_seq, rotary_emb)
+        return und_seq, gen_seq
+
+
+def test_activation_checkpointing_recomputes_with_the_same_pack_metadata():
+    import copy
+
+    torch.manual_seed(0)
+    reference_model = _CheckpointedCosmos3OmniTransformer(num_layers=2).double()
+    reference_model.gradient_checkpointing = False
+    checkpointed_model = copy.deepcopy(reference_model)
+    meta = TwoWayPackedMeta([4, 3], [2, 5])
+    set_cosmos3_packed_meta(reference_model, meta, strict=True)
+    set_cosmos3_packed_meta(checkpointed_model, meta, strict=True)
+
+    und_seq, gen_seq, rotary_emb = _inputs([4, 3], [2, 5], seed=40)
+    reference_inputs = [und_seq.clone().requires_grad_(True), gen_seq.clone().requires_grad_(True), rotary_emb]
+    checkpointed_inputs = [und_seq.clone().requires_grad_(True), gen_seq.clone().requires_grad_(True), rotary_emb]
+
+    reference_und, reference_gen = reference_model(*reference_inputs)
+    (reference_und.square().sum() + reference_gen.square().sum()).backward()
+    checkpointed_und, checkpointed_gen = checkpointed_model(*checkpointed_inputs)
+    (checkpointed_und.square().sum() + checkpointed_gen.square().sum()).backward()
+
+    torch.testing.assert_close(checkpointed_und, reference_und, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(checkpointed_gen, reference_gen, rtol=1e-12, atol=1e-12)
+    for (name, reference), (checkpointed_name, actual) in zip(
+        reference_model.named_parameters(), checkpointed_model.named_parameters()
+    ):
+        assert name == checkpointed_name
+        assert reference.grad is not None and actual.grad is not None
+        torch.testing.assert_close(actual.grad, reference.grad, rtol=1e-10, atol=1e-12)
+
+
+def test_processor_accepts_the_cuda_backend_label():
+    processor = ColossalTwoWayAttnProcessor(backend="cuda")
+    assert processor.backend == "cuda"
+
+    with pytest.raises(ValueError, match="backend"):
+        ColossalTwoWayAttnProcessor(backend="sdpa")
+
+
+def _packed_real_model_reference(model, packs, device):
+    """Run each sample through the stock processor and keep the per-sample outputs."""
+    references = []
+    with torch.no_grad():
+        for pack in packs:
+            references.append(model(**_to_device(pack, device)))
+    return references
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused CUDA backend needs a CUDA device")
+def test_real_model_packed_forward_with_the_cuda_backend_matches_stock_runs():
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = _tiny_cosmos3().to(device=device, dtype=torch.bfloat16)
+    pack_a = _to_device(_single_sample_pack(n_text=3, frames=2, seed=11), device)
+    pack_b = _to_device(_single_sample_pack(n_text=4, frames=3, seed=12, domain_id=1), device)
+    references = _packed_real_model_reference(model, [pack_a, pack_b], device)
+
+    policy = Cosmos3OmniPolicy(backend="cuda")
+    ShardFormer(ShardConfig(enable_tensor_parallelism=False)).optimize(model, policy=policy)
+    dm_lens = [int(pack["sequence_length"]) - int(pack["und_len"]) for pack in (pack_a, pack_b)]
+    policy.set_packed_meta(TwoWayPackedMeta([pack_a["und_len"], pack_b["und_len"]], dm_lens))
+    with torch.no_grad():
+        packed = model(**_to_device(_merge_single_sample_packs([pack_a, pack_b]), device))
+
+    for index, reference in enumerate(references):
+        torch.testing.assert_close(packed.sample[index], reference.sample[0], atol=5e-3, rtol=5e-3)
+        torch.testing.assert_close(packed.action[index], reference.action[0], atol=5e-3, rtol=5e-3)

@@ -22,6 +22,7 @@ __all__ = [
     "ColossalTwoWayAttnProcessor",
     "Cosmos3TwoWayAttnProcessor",
     "set_cosmos3_packed_meta",
+    "clear_cosmos3_packed_meta",
 ]
 
 _ATTENTION_CLS = "Cosmos3PackedMoTAttention"
@@ -42,10 +43,14 @@ class ColossalTwoWayAttnProcessor:
     -- before the forward; without them the whole pack counts as one sample, the stock batch-size-one behaviour.
 
     Args:
-        backend (str, optional): ``"naive"`` for the PyTorch reference or ``"npu"`` for the Ascend fusion path.
-            Defaults to ``"naive"`` so the processor also runs on CPU and GPU.
+        backend (str, optional): ``"naive"`` for the PyTorch reference, ``"npu"`` for the Ascend fusion path or
+            ``"cuda"`` for PyTorch's native packed CUDA kernel. Defaults to ``"naive"`` so the processor also runs on
+            CPU.
         packed_meta (Optional[TwoWayPackedMeta], optional): Per-sample AR/DM lengths of the pack. When omitted, every
             forward is treated as a single sample whose lengths are read from the two input tensors.
+        scale (Optional[float], optional): Softmax scale forwarded to the two-way kernel. Defaults to None.
+        dropout_p (float, optional): Attention dropout. The CUDA backend rejects a non-zero value because the native
+            packed kernel has no dropout. Defaults to 0.0.
 
     Raises:
         ValueError: If ``backend`` is unknown.
@@ -56,11 +61,22 @@ class ColossalTwoWayAttnProcessor:
     _attention_backend = None
     _parallel_config = None
 
-    def __init__(self, backend: str = "naive", packed_meta: Optional[TwoWayPackedMeta] = None) -> None:
-        if backend not in ("naive", "npu"):
-            raise ValueError(f"backend must be 'naive' or 'npu', got {backend!r}.")
+    def __init__(
+        self,
+        backend: str = "naive",
+        packed_meta: Optional[TwoWayPackedMeta] = None,
+        scale: Optional[float] = None,
+        dropout_p: float = 0.0,
+    ) -> None:
+        if backend not in ("naive", "npu", "cuda"):
+            raise ValueError(f"backend must be 'naive', 'npu' or 'cuda', got {backend!r}.")
         self.backend = backend
+        self.scale = scale
+        self.dropout_p = dropout_p
         self.packed_meta: Optional[TwoWayPackedMeta] = None
+        # Bumped on every metadata change. A training loop can compare it around a step to prove the pack that
+        # produced an output is the pack its backward recompute will see.
+        self.meta_epoch = 0
         if packed_meta is not None:
             self.set_packed_meta(packed_meta)
 
@@ -84,6 +100,11 @@ class ColossalTwoWayAttnProcessor:
                 f"{type(packed_meta).__name__}."
             )
         self.packed_meta = packed_meta
+        self.meta_epoch += 1
+
+    def clear_packed_meta(self) -> None:
+        """Drop the pack metadata, restoring the single-sample fallback for the next forward."""
+        self.set_packed_meta(None)
 
     def _resolve_meta(self, num_ar_tokens: int, num_dm_tokens: int) -> TwoWayPackedMeta:
         if self.packed_meta is None:
@@ -145,6 +166,8 @@ class ColossalTwoWayAttnProcessor:
             meta,
             backend=self.backend,
             k_ar_for_gen=k_und_for_gen,
+            scale=self.scale,
+            dropout_p=self.dropout_p,
         )
 
         # Per-pathway output projection.
@@ -155,7 +178,7 @@ class ColossalTwoWayAttnProcessor:
 Cosmos3TwoWayAttnProcessor = ColossalTwoWayAttnProcessor
 
 
-def set_cosmos3_packed_meta(model: torch.nn.Module, packed_meta) -> int:
+def set_cosmos3_packed_meta(model: torch.nn.Module, packed_meta, strict: bool = False) -> int:
     """Set the pack metadata on every Cosmos 3 attention processor in ``model``.
 
     This is the plugin-agnostic path: it walks the module tree, so it also works through a ``Booster`` wrapper
@@ -165,9 +188,15 @@ def set_cosmos3_packed_meta(model: torch.nn.Module, packed_meta) -> int:
         model (torch.nn.Module): The Cosmos 3 transformer, wrapped or unwrapped.
         packed_meta (Optional[TwoWayPackedMeta]): Metadata for the next forward; see
             :meth:`ColossalTwoWayAttnProcessor.set_packed_meta`.
+        strict (bool, optional): Raise if no Cosmos 3 attention processor was found. A training entry point should
+            pass ``strict=True`` so a model that was not sharded through the policy fails loudly instead of training
+            with the stock single-sample processor. Defaults to False.
 
     Returns:
         int: Number of attention processors updated.
+
+    Raises:
+        RuntimeError: If ``strict`` is true and no processor was updated.
     """
     updated = 0
     for module in model.modules():
@@ -178,4 +207,25 @@ def set_cosmos3_packed_meta(model: torch.nn.Module, packed_meta) -> int:
         if setter is not None:
             setter(packed_meta)
             updated += 1
+    if strict and updated == 0:
+        raise RuntimeError(
+            f"No Cosmos 3 attention processor was found in {type(model).__name__}. Boost the model through "
+            f"Cosmos3OmniPolicy before setting pack metadata, or call this helper on the unwrapped transformer."
+        )
     return updated
+
+
+def clear_cosmos3_packed_meta(model: torch.nn.Module, strict: bool = False) -> int:
+    """Remove pack metadata from every Cosmos 3 attention processor in ``model``.
+
+    Call this after a packed step has completed. It restores the stock single-sample behaviour, so a later forward
+    cannot silently reuse the previous pack's boundaries.
+
+    Args:
+        model (torch.nn.Module): The Cosmos 3 transformer, wrapped or unwrapped.
+        strict (bool, optional): Raise if no Cosmos 3 attention processor was found. Defaults to False.
+
+    Returns:
+        int: Number of attention processors updated.
+    """
+    return set_cosmos3_packed_meta(model, None, strict=strict)

@@ -26,9 +26,14 @@ TESTS=(
     tests/test_shardformer/test_layer/test_segmented_attn.py
     tests/test_shardformer/test_layer/test_two_way_attn.py
     tests/test_shardformer/test_npu_attention_args.py
+    tests/test_shardformer/test_model/test_cosmos_mot_packing.py
+    tests/test_shardformer/test_model/test_cosmos3_policy.py
+    tests/test_shardformer/test_model/test_cosmos3_example_helpers.py
+    tests/test_shardformer/test_model/test_shard_cosmos3.py
     tests/test_tensor/test_dtensor/test_dtensor_sharding_spec.py
     tests/test_tensor/test_shape_consistency.py
     tests/test_tensor/test_sharding_spec.py
+    tests/test_zero/test_low_level/test_unscale_and_clip_grads.py
 )
 
 if [[ ! -d "${REPO}/tests" ]]; then

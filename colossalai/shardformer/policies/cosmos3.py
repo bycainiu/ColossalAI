@@ -38,8 +38,9 @@ class Cosmos3OmniPolicy(Policy):
 
     Args:
         backend (str, optional): Attention backend for
-            :class:`~colossalai.shardformer.modeling.cosmos3.ColossalTwoWayAttnProcessor`: ``"naive"`` (portable) or
-            ``"npu"`` (Ascend fusion kernel). Defaults to ``"naive"``.
+            :class:`~colossalai.shardformer.modeling.cosmos3.ColossalTwoWayAttnProcessor`: ``"naive"`` (portable),
+            ``"npu"`` (Ascend fusion kernel) or ``"cuda"`` (PyTorch's native packed CUDA kernel). Defaults to
+            ``"naive"``.
         processor (optional): A ready-made processor to install instead of building one from ``backend``. Use this to
             share a processor with code that already holds one, e.g. a script that pre-sets pack metadata.
 
