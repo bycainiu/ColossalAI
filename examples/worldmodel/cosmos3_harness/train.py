@@ -41,9 +41,17 @@ from colossalai.shardformer.modeling.cosmos_mot import Cosmos3PackedBatch, pack_
 try:
     from examples.worldmodel.cosmos3_harness.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
     from examples.worldmodel.cosmos3_harness.optim import build_adamw
+    from examples.worldmodel.cosmos3_harness.training_metrics import (
+        AnomalyDetector,
+        ConsoleObserver,
+        TrainingMetrics,
+        WandbObserver,
+        device_memory_gib,
+    )
 except ImportError:  # direct execution from the example directory
     from loss import combine_modality_losses, normalise_packed_loss, velocity_mse
     from optim import build_adamw
+    from training_metrics import AnomalyDetector, ConsoleObserver, TrainingMetrics, WandbObserver, device_memory_gib
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -73,6 +81,21 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "same environment block and metric definitions as bench_ops.py.",
     )
     parser.add_argument("--bench-warmup", type=int, default=5, help="Steps excluded from --bench-json timings.")
+    parser.add_argument(
+        "--metrics-dir",
+        help="Directory for the per-rank JSONL metrics (run.json, rank-*.jsonl, summary.json). Defaults to "
+        "<save-dir>/metrics when --save-dir is set.",
+    )
+    parser.add_argument("--metrics-every", type=int, default=10, help="Aggregate and report metrics every N steps.")
+    parser.add_argument("--wandb-project", help="Log the aggregated metrics to Weights & Biases from rank 0.")
+    parser.add_argument(
+        "--wandb-mode",
+        default="offline",
+        choices=("offline", "online", "disabled"),
+        help="W&B mode. Offline is the default because training hosts are often isolated; sync the run directory "
+        "later with 'wandb sync'.",
+    )
+    parser.add_argument("--wandb-run-name", help="W&B run name; defaults to W&B's generated name.")
     parser.add_argument("--dry-run", action="store_true", help="Exercise packing and loss on CPU; no model or GPU.")
     return parser.parse_args(argv)
 
@@ -107,6 +130,71 @@ def _build_optimizer(
         eps=eps,
         weight_decay=weight_decay,
     )
+
+
+def _metrics_dir(args: argparse.Namespace) -> Optional[str]:
+    """Where the JSONL metrics go: --metrics-dir, else <save-dir>/metrics, else none."""
+    if args.metrics_dir:
+        return args.metrics_dir
+    if args.save_dir:
+        return str(Path(args.save_dir) / "metrics")
+    return None
+
+
+def _device_capacity_gib(device: torch.device) -> Optional[float]:
+    """Total HBM of one device, for the memory-pressure check; None when the build cannot report it."""
+    try:
+        if device.type == "npu":
+            import torch_npu  # noqa: F401
+
+            return torch.npu.get_device_properties(device).total_memory / 2**30
+        if device.type == "cuda":
+            return torch.cuda.get_device_properties(device).total_memory / 2**30
+    except Exception:
+        return None
+    return None
+
+
+def _run_manifest(args: argparse.Namespace, device: torch.device, backend: str, world_size: int) -> Dict:
+    """Identity of this run: configuration, topology and the environment block bench_ops already defines."""
+    try:
+        from examples.worldmodel.cosmos3_harness.bench_ops import collect_env
+    except ImportError:  # direct execution from the example directory
+        from bench_ops import collect_env
+
+    return {
+        "args": dict(vars(args)),
+        "env": collect_env(device),
+        "backend": backend,
+        "world_size": world_size,
+        "topology": {"tp": 1, "pp": 1, "sp": 1, "zero_stage": args.zero_stage},
+        "model": args.model,
+        "replay_pack": args.replay_pack,
+        "eval_pack": args.eval_pack,
+        "heldout_manifest": args.heldout_manifest,
+    }
+
+
+def _build_metrics(args: argparse.Namespace, rank: int, world_size: int, device: torch.device, backend: str):
+    """Build the metrics facade, or None when no sink is configured."""
+    out_dir = _metrics_dir(args)
+    wandb_enabled = bool(args.wandb_project) and args.wandb_mode != "disabled"
+    if out_dir is None and not wandb_enabled:
+        return None
+
+    aggregate_observers = [ConsoleObserver()]
+    if wandb_enabled:
+        aggregate_observers.append(WandbObserver(args.wandb_project, args.wandb_run_name, mode=args.wandb_mode))
+    metrics = TrainingMetrics(
+        out_dir=out_dir,
+        rank=rank,
+        world_size=world_size,
+        log_every=args.metrics_every,
+        aggregate_observers=aggregate_observers,
+        detector=AnomalyDetector(device_capacity_gib=_device_capacity_gib(device)),
+    )
+    metrics.start(_run_manifest(args, device, backend, world_size))
+    return metrics
 
 
 def _synthetic_sample(und_len: int, dm_len: int, seed: int) -> Dict:
@@ -358,6 +446,8 @@ def train(args: argparse.Namespace) -> int:
     model, optimizer, _, _, _ = booster.boost(model=model, optimizer=optimizer)
     model._colossal_booster = booster
 
+    metrics = _build_metrics(args, rank, world_size, next(model.parameters()).device, backend)
+
     packs = _load_replay_packs(args.replay_pack)
     start_step = 0
     epoch = 0
@@ -380,15 +470,18 @@ def train(args: argparse.Namespace) -> int:
         booster.backward(loss, optimizer)
         optimizer.step()
         clear_cosmos3_packed_meta(model, strict=True)
-        step_times.append(time.perf_counter() - step_start)
+        step_ms = (time.perf_counter() - step_start) * 1e3
+        step_times.append(step_ms / 1e3)
 
-        if rank == 0 and (step + 1) % args.log_interval == 0:
+        log_now = (step + 1) % args.log_interval == 0
+        loss_value = float(loss.detach().cpu()) if log_now else None
+        if rank == 0 and log_now and metrics is None:
             elapsed = time.time() - begin
             print(
                 json.dumps(
                     {
                         "step": step + 1,
-                        "loss": float(loss.detach().cpu()),
+                        "loss": loss_value,
                         "supervised_tokens": batch.total_supervised_tokens,
                         "real_tokens": batch.layout.real_tokens,
                         "pad_tokens": batch.layout.pad_tokens,
@@ -397,6 +490,31 @@ def train(args: argparse.Namespace) -> int:
                 ),
                 flush=True,
             )
+        if metrics is not None:
+            sections = {
+                "data": {
+                    "samples": len(samples),
+                    "supervised_tokens": batch.total_supervised_tokens,
+                    "ar_tokens": batch.meta.total_ar_tokens,
+                    "dm_tokens": batch.meta.total_dm_tokens,
+                    "real_tokens": batch.layout.real_tokens,
+                    "pad_tokens": batch.layout.pad_tokens,
+                },
+                "perf": {"step_ms": step_ms},
+            }
+            if log_now:
+                optim_section = {}
+                getter = getattr(optimizer, "get_grad_norm", None)
+                if getter is not None:
+                    optim_section["grad_norm"] = getter()
+                try:
+                    optim_section["lr"] = optimizer.param_groups[0]["lr"]
+                except (AttributeError, IndexError, KeyError):
+                    optim_section["lr"] = args.learning_rate
+                sections["loss"] = {"total": loss_value}
+                sections["optim"] = optim_section
+                sections["mem"] = device_memory_gib()
+            metrics.step(step + 1, **sections)
         if args.save_dir and (step + 1) % args.save_interval == 0:
             _save_state(Path(args.save_dir), model, optimizer, step + 1, epoch, sampler_cursor + step + 1)
 
@@ -422,6 +540,22 @@ def train(args: argparse.Namespace) -> int:
                 clear_cosmos3_packed_meta(model, strict=True)
         if rank == 0:
             print(json.dumps({"heldout_losses": losses}), flush=True)
+
+    if metrics is not None:
+        timed = step_times[args.bench_warmup :] or step_times
+        ordered = sorted(timed)
+        summary = {"steps": args.steps - start_step}
+        if ordered:
+            summary.update(
+                {
+                    "step_ms_median": ordered[len(ordered) // 2] * 1e3,
+                    "step_ms_min": ordered[0] * 1e3,
+                    "step_ms_mean": sum(timed) / len(timed) * 1e3,
+                }
+            )
+        if args.eval_pack:
+            summary["heldout_losses"] = losses
+        metrics.finish(summary)
 
     dist.destroy_process_group()
     return 0
