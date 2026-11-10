@@ -83,9 +83,9 @@ ShardFormer opt policy does not support this configuration with transformers 5.1
 - 入口：`Cosmos3OmniPolicy`，自动注册到 `diffusers.models.transformers.transformer_cosmos3.Cosmos3OmniTransformer`；模型不是 Transformers 类，因此不适用 HF5 模型族门禁。
 - 注意力后端：`naive`（可移植参考）、`npu`（Ascend 两次 varlen 调用）、`cuda`（PyTorch 原生 packed `varlen_attn`）。后端必须显式选择；policy 默认 `naive`，不会因检测到加速器而静默切换。
 - 已由 CPU 契约测试覆盖：多样本打包与索引重排、逐样本隔离、梯度/一步更新、激活重检查点重计算一致、`HybridParallelPlugin + Cosmos3OmniPolicy` 的单 rank backward/step，以及单 rank 模型保存/加载。
-- 仅支持 `tp=pp=sp=1`、BF16 DP/ZeRO。policy 明确拒绝 pipeline 和 sequence parallel；现有 TP 描述符未做数值验收。
+- 默认支持 BF16 DP/ZeRO；TP 通过 ShardFormer 的 column/row 投影实现，但未做数值验收。Ulysses CP 只在 `enable_sequence_parallelism=True` 且 `sequence_parallelism_mode="all_to_all"` 时启用；policy 明确拒绝 PP、非 all_to_all 的 SP、TP+CP、CP 下的 fp8 communication，以及 `ShardConfig.gradient_checkpoint_config`。
 - **未认证**：真实 1/2/8 卡数值与吞吐、Ascend 融合路径的数值/性能门禁、完整 SFT 收敛、跨拓扑 optimizer/RNG 等价。
-- 版本基线记录为 torch 2.13.0 / transformers 5.17.0 / diffusers 0.35.2；实际 Cosmos 类来源必须在两端分别核对，不能只比较版本号。
+- 版本基线记录为 torch 2.13.0 / transformers 5.17.0；Cosmos 3 需要 `diffusers>=0.40.0`（CP seam 从该版本开始提供），仓库核心 requirements 的 `diffusers==0.35.2` 不能运行 Cosmos 3。实际 Cosmos 类来源必须在两端分别核对，不能只比较版本号。
 
 CI：Cosmos 的 CPU 契约测试已登记到 CPU batch；GPU/NPU 用例需要对应硬件与显式 backend 选择，不能在缺少设备时以 skip 当作 PASS。
 
