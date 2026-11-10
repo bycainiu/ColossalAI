@@ -22,6 +22,7 @@ from colossalai.shardformer.layer import Linear1D_Col, Linear1D_Row, TwoWayPacke
 from colossalai.shardformer.modeling.cosmos3 import (
     ColossalTwoWayAttnProcessor,
     ColossalTwoWayCPAttnProcessor,
+    Cosmos3ContextParallel,
     clear_cosmos3_packed_meta,
     set_cosmos3_packed_meta,
 )
@@ -282,6 +283,20 @@ def test_context_parallel_processor_handles_an_empty_pathway():
 
     assert processor._exchange(empty).shape == empty.shape
     assert processor._exchange_back(empty).shape == empty.shape
+
+
+def test_context_parallel_helper_delegates_metadata_and_carries_options():
+    helper = Cosmos3ContextParallel(process_group=None, scale=0.25, dropout_p=0.0)
+    meta = TwoWayPackedMeta([4, 3], [2, 5])
+
+    assert helper.packed_meta is None
+    helper.set_packed_meta(meta)
+    assert helper.packed_meta is meta
+    assert helper.processor.scale == 0.25
+    assert helper.processor.dropout_p == 0.0
+
+    helper.clear_packed_meta()
+    assert helper.packed_meta is None
 
 
 def test_processor_rejects_an_unknown_backend():

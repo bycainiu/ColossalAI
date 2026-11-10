@@ -199,7 +199,8 @@ def test_context_parallel_policy_preserves_preset_pack_metadata(tmp_path):
             pp_size=1,
             sp_size=1,
             enable_sequence_parallelism=True,
-            sequence_parallelism_mode="all_to_all",
+            # Leave the mode unset: the plugin resolves it to all_to_all and has to pass that resolved value into
+            # ShardConfig, otherwise the policy would see split_gather and reject the run.
             precision="fp32",
             zero_stage=0,
             custom_policy=policy,
