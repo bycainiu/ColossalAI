@@ -157,9 +157,75 @@ def parse_args():
         "weights are copied to pinned host memory before the next optimizer step, so the writers always read a "
         "stable copy.",
     )
+    parser.add_argument(
+        "--compile-vae",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile the frozen VAE encoder with static shapes, one graph per canvas -- the official stack's "
+        "second tokenizer optimisation (report Sec. 5.2.6). Off on this device because both backends were measured "
+        "and neither pays: `inductor` cannot lower even a plain `sum(dim=1)` without triton-ascend, and "
+        "`npugraph_ex` captures in 21 s but then encodes in 16.6 s instead of 0.93 s (18x slower). See "
+        "draft_cosmos3_vae_optimization_zh.md Sec. 12; fuse the RMSNorm by hand instead.",
+    )
+    parser.add_argument(
+        "--compile-vae-backend",
+        default="npugraph_ex",
+        choices=["npugraph_ex", "inductor"],
+        help="torch.compile backend for --compile-vae. `inductor` is the official stack's backend and needs "
+        "triton-ascend, which this image does not have; `npugraph_ex` is Ascend's own ACL-graph engine (torchair), "
+        "correct but measured 18x slower than eager on this encoder.",
+    )
+    parser.add_argument(
+        "--vae-dtype",
+        default="float32",
+        choices=["float32", "float16"],
+        help="Precision of the frozen VAE encoder, which is most of a step's data-side cost. fp16 encodes one sample "
+        "in 0.499 s instead of 1.229 s (2.46x) on a 910B2, and its latent differs from the fp32 one by 0.58-0.64x of "
+        "the bf16 quantisation pack_batch applies anyway -- measured over 64 real DROID windows spread across all "
+        "eight cards. bfloat16 is deliberately not offered: at 4.7-5.0x that quantisation it is worse than the cast "
+        "it would replace.",
+    )
+    parser.add_argument(
+        "--vae-chunk-frames",
+        type=int,
+        default=8,
+        help="Pixel frames per encoder call, after the one-frame prime. diffusers' own window is 4 (one latent "
+        "chunk). The official tokenizer encodes 24 at 480p and calls this the bulk of its speedup (report Sec. "
+        "5.2.6), but that is tuned for its GPUs: on a 910B2 the encoder is already device-saturated at 4 frames. "
+        "Before --fast-vae-encoder, wider windows bought 1.04-1.05x by amortising the pad+cat copy; with that copy "
+        "gone the window no longer trades time for memory -- 4/8/12 frames all encode in 0.70-0.72 s at batch 2, "
+        "while peak grows 4.9 -> 6.6 -> 8.4 GiB -- so 8 is the knee (5 calls, 1.03x over 4, 1.7 GiB under 12). "
+        "Measured in scripts/profile_vae_recipe.py. The causal caches carry across calls, so the latent is "
+        "unchanged to 3.6e-05 relative, 0.03x of the bf16 cast pack_batch applies. 0 keeps diffusers' loop. Must "
+        "be a multiple of 4.",
+    )
+    parser.add_argument(
+        "--fuse-vae-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Swap the frozen VAE's RMSNorm for a cheaper forward: the reduction stays in fp32, but `scale / norm` "
+        "is divided on the small [B,1,T,H,W] tensor instead of the activation, the dead `+0.0` bias disappears, and "
+        "the fp32 up/down-cast round trip goes away -- six full passes over the activation become two. Numerically "
+        "it adds at most one rounding of the input dtype per element and lands at 0.615x the bf16 cast pack_batch "
+        "applies anyway (diffusers' own is 0.604x). Measured 0.927 -> 0.748 s (1.24x) in fp16 at batch 2, and "
+        "1.05 GiB less peak; only 1.06x in fp32, so this default matters for the fp16 recipe. "
+        "See scripts/profile_vae_norm.py and draft_cosmos3_vae_optimization_zh.md Sec. 13.",
+    )
+    parser.add_argument(
+        "--fast-vae-encoder",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Two exact changes to the frozen VAE's convolution path: the symmetric H/W padding is handed to the "
+        "convolution instead of being materialised by F.pad (in steady state the feature cache supplies the causal "
+        "T frames, so no pad is copied at all), and the dead `x.clone()` in WanResidualDownBlock is dropped. Both "
+        "are bit-identical to diffusers' forward -- tests/test_vae_fast_encoder.py asserts torch.equal -- so unlike "
+        "the fused norm there is no accuracy trade at all. See draft_cosmos3_vae_optimization_zh.md Sec. 14.",
+    )
     args = parser.parse_args()
     if args.data is None and args.latents is None:
         parser.error("one of --data or --latents is required")
+    if args.vae_chunk_frames and args.vae_chunk_frames % 4:
+        parser.error("--vae-chunk-frames must be a multiple of 4")
     return args
 
 
@@ -186,20 +252,45 @@ def build_tokenizer(checkpoint: Path):
     return AutoTokenizer.from_pretrained(checkpoint / "text_tokenizer")
 
 
-def build_vae(checkpoint: Path):
+def build_vae(
+    checkpoint: Path,
+    dtype: torch.dtype = torch.float32,
+    chunk_frames: int = 0,
+    fuse_norm: bool = False,
+    fast_encoder: bool = True,
+):
     """Load the VAE frozen. It runs inside the training loop and never enters the booster.
 
     HF32 has to be off. With it on, the error of an fp32 convolution on Ascend was measured at 210x the CPU
     result, which leaves the latents subtly wrong; the symptom is a loss curve that does not match the reference
     device, which is very hard to trace back to here.
+
+    ``dtype`` is the encoder's precision; see ``--vae-dtype``. It is passed to ``from_pretrained`` rather than
+    applied with ``.to()`` afterwards, so that any module diffusers wants kept in fp32 stays fp32.
+
+    ``chunk_frames`` widens the encoder call window past diffusers' four pixel frames; see ``--vae-chunk-frames``.
+    ``fuse_norm`` and ``fast_encoder`` replace the two cheapest passes diffusers makes over the activation; see
+    ``--fuse-vae-norm`` and ``--fast-vae-encoder``.
     """
     from diffusers import AutoencoderKLWan
 
     torch.npu.conv.allow_hf32 = False
     torch.set_float32_matmul_precision("highest")
-    vae = AutoencoderKLWan.from_pretrained(checkpoint / "vae", torch_dtype=torch.float32).eval()
+    vae = AutoencoderKLWan.from_pretrained(checkpoint / "vae", torch_dtype=dtype).eval()
     for p in vae.parameters():
         p.requires_grad = False
+    if chunk_frames:
+        from vae_chunked import enable_chunked_encode
+
+        enable_chunked_encode(vae, chunk_frames)
+    if fuse_norm:
+        from vae_fused_norm import enable_fused_rmsnorm
+
+        enable_fused_rmsnorm(vae)
+    if fast_encoder:
+        from vae_fast_encoder import enable_fast_encoder
+
+        enable_fast_encoder(vae)
     return vae
 
 
@@ -223,9 +314,9 @@ def build_optimizer(model):
 # Precomputed-latent bypass
 #
 # The upstream pipeline does not precompute: augmentation happens before the VAE, so caching latents freezes the
-# augmentation, and the VAE is compiled and trained alongside the model. Reading latents from disk is only a way
-# to exercise the training loop and reproduce numbers without video, and it does not stand in for the real data
-# pipeline.
+# augmentation, and the VAE runs inside the training step -- frozen, and torch.compiled by upstream's
+# `compile_tokenizer` callback. Reading latents from disk is only a way to exercise the training loop and
+# reproduce numbers without video, and it does not stand in for the real data pipeline.
 # ---------------------------------------------------------------------------------------------------------------
 _SAFETENSOR_HANDLES: dict = {}
 
@@ -410,7 +501,23 @@ def main():
     model_config = model.config  # booster returns a wrapper, so keep the config before boosting
     tokenizer = build_tokenizer(args.checkpoint)
     if not args.latents:
-        vae = build_vae(args.checkpoint).to(torch.npu.current_device())
+        vae = build_vae(
+            args.checkpoint,
+            getattr(torch, args.vae_dtype),
+            args.vae_chunk_frames,
+            args.fuse_vae_norm,
+            args.fast_vae_encoder,
+        ).to(torch.npu.current_device())
+        coord.print_on_master(
+            f"[vae] dtype={args.vae_dtype} window={args.vae_chunk_frames or 4} frames per encoder call, "
+            f"norm={'fused' if args.fuse_vae_norm else 'diffusers'}, "
+            f"conv={'fast' if args.fast_vae_encoder else 'diffusers'}"
+        )
+        if args.compile_vae:
+            # Compile the private encoder, not `encode`: the public method carries diffusers' forward hook. Static
+            # shapes, so there is one graph per canvas bucket rather than one graph per step -- the encoder is called
+            # on a whole batch of identically shaped windows. `dynamic=True` would defeat the capture.
+            vae._encode = torch.compile(vae._encode, backend=args.compile_vae_backend, dynamic=False)
     optimizer = build_optimizer(model)
 
     # Cosmos3OmniPolicy does three things: it installs the two-way attention processor in postprocess(), after the
