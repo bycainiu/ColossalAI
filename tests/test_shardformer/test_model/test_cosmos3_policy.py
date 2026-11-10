@@ -21,6 +21,7 @@ from colossalai.shardformer import ShardConfig, ShardFormer
 from colossalai.shardformer.layer import Linear1D_Col, Linear1D_Row, TwoWayPackedMeta
 from colossalai.shardformer.modeling.cosmos3 import (
     ColossalTwoWayAttnProcessor,
+    ColossalTwoWayCPAttnProcessor,
     clear_cosmos3_packed_meta,
     set_cosmos3_packed_meta,
 )
@@ -257,6 +258,32 @@ def test_processor_rejects_metadata_from_another_pack():
         processor(attn, und_seq, gen_seq, rotary_emb)
 
 
+def test_context_parallel_processor_rejects_metadata_from_another_pack_before_exchanging():
+    attn = Cosmos3PackedMoTAttention().double()
+    processor = ColossalTwoWayCPAttnProcessor(packed_meta=TwoWayPackedMeta([2, 1], [1, 2]))
+    und_seq, gen_seq, rotary_emb = _inputs([4], [3])
+    processor.set_sequence_lengths(und_seq.shape[0], gen_seq.shape[0])
+
+    with pytest.raises(ValueError, match="CP shard seam carries 4 AR and 3 DM tokens"):
+        processor(attn, und_seq, gen_seq, rotary_emb)
+
+
+def test_context_parallel_processor_exchange_is_a_noop_at_cp_size_one():
+    processor = ColossalTwoWayCPAttnProcessor(process_group=None)
+    x = torch.randn(3, NUM_HEADS, HEAD_DIM)
+
+    assert processor._exchange(x) is x
+    assert processor._exchange_back(x) is x
+
+
+def test_context_parallel_processor_handles_an_empty_pathway():
+    processor = ColossalTwoWayCPAttnProcessor(process_group=None)
+    empty = torch.empty(0, NUM_HEADS, HEAD_DIM)
+
+    assert processor._exchange(empty).shape == empty.shape
+    assert processor._exchange_back(empty).shape == empty.shape
+
+
 def test_processor_rejects_an_unknown_backend():
     with pytest.raises(ValueError, match="backend"):
         ColossalTwoWayAttnProcessor(backend="flash")
@@ -299,6 +326,7 @@ def _stand_in_shard_config(**overrides):
         enable_sequence_parallelism=False,
         fp8_communication=False,
         pipeline_stage_manager=None,
+        gradient_checkpoint_config=None,
     )
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -316,9 +344,73 @@ def test_policy_rejects_pipeline_parallelism():
         _policy_with(_stand_in_shard_config(pipeline_stage_manager=object()))
 
 
-def test_policy_rejects_sequence_parallelism():
-    with pytest.raises(NotImplementedError, match="sequence parallelism"):
-        _policy_with(_stand_in_shard_config(enable_sequence_parallelism=True))
+def test_policy_rejects_sequence_parallelism_that_is_not_ulysses():
+    # Only the all-to-all (Ulysses) flavour keeps whole per-sample blocks on the attention side; the split-gather
+    # and ring flavours cut inside a block, which the two-way kernel cannot represent.
+    with pytest.raises(NotImplementedError, match="all_to_all"):
+        _policy_with(
+            _stand_in_shard_config(
+                enable_sequence_parallelism=True,
+                sequence_parallelism_mode="split_gather",
+                sequence_parallel_size=2,
+            )
+        )
+
+
+def test_policy_rejects_context_parallelism_mixed_with_tensor_parallelism():
+    with pytest.raises(NotImplementedError, match="tensor parallelism"):
+        _policy_with(
+            _stand_in_shard_config(
+                enable_sequence_parallelism=True,
+                sequence_parallelism_mode="all_to_all",
+                sequence_parallel_size=2,
+                enable_tensor_parallelism=True,
+                tensor_parallel_size=2,
+            )
+        )
+
+
+def test_policy_rejects_a_context_parallel_group_that_cannot_split_the_heads():
+    with pytest.raises(ValueError, match="divisible by the context parallel size"):
+        _policy_with(
+            _stand_in_shard_config(
+                enable_sequence_parallelism=True,
+                sequence_parallelism_mode="all_to_all",
+                sequence_parallel_size=3,
+            )
+        )
+
+
+def test_context_parallel_policy_rewrites_no_module():
+    # Ulysses CP only swaps the processor and wires the model's seams, both in postprocess().
+    assert (
+        _policy_with(
+            _stand_in_shard_config(
+                enable_sequence_parallelism=True,
+                sequence_parallelism_mode="all_to_all",
+                sequence_parallel_size=2,
+            )
+        ).module_policy()
+        == {}
+    )
+
+
+def test_policy_rejects_fp8_context_parallelism():
+    with pytest.raises(NotImplementedError, match="fp8 communication"):
+        _policy_with(
+            _stand_in_shard_config(
+                enable_sequence_parallelism=True,
+                sequence_parallelism_mode="all_to_all",
+                sequence_parallel_size=2,
+                fp8_communication=True,
+            )
+        )
+
+
+def test_policy_rejects_shardformer_gradient_checkpoint_config():
+    marker = object()
+    with pytest.raises(NotImplementedError, match="gradient_checkpoint_config"):
+        _policy_with(_stand_in_shard_config(gradient_checkpoint_config=marker))
 
 
 def test_policy_rejects_shardformer_optimizations_it_does_not_implement():

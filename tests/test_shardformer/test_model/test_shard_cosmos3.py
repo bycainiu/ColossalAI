@@ -19,6 +19,7 @@ from colossalai.booster.plugin import HybridParallelPlugin
 from colossalai.shardformer.layer import TwoWayPackedMeta
 from colossalai.shardformer.modeling.cosmos3 import (
     ColossalTwoWayAttnProcessor,
+    ColossalTwoWayCPAttnProcessor,
     clear_cosmos3_packed_meta,
     set_cosmos3_packed_meta,
 )
@@ -73,6 +74,9 @@ class Cosmos3PackedMoTAttention(torch.nn.Module):
 
 
 class Cosmos3OmniTransformer(torch.nn.Module):
+    _cp_shard_fn = None
+    _cp_gather_fn = None
+
     def __init__(self, num_layers: int = 2) -> None:
         super().__init__()
         self.config = SimpleNamespace(
@@ -83,8 +87,12 @@ class Cosmos3OmniTransformer(torch.nn.Module):
         self.layers = torch.nn.ModuleList([Cosmos3PackedMoTAttention(seed=index) for index in range(num_layers)])
 
     def forward(self, und_seq, gen_seq, rotary_emb):
+        if self._cp_shard_fn is not None:
+            und_seq, gen_seq, rotary_emb = self._cp_shard_fn(und_seq, gen_seq, rotary_emb)
         for layer in self.layers:
             und_seq, gen_seq = layer(und_seq, gen_seq, rotary_emb)
+        if self._cp_gather_fn is not None:
+            und_seq, gen_seq = self._cp_gather_fn(und_seq, gen_seq)
         return und_seq, gen_seq
 
 
@@ -170,7 +178,57 @@ def test_hybrid_plugin_installs_the_processor_updates_parameters_and_reloads(tmp
         set_accelerator(previous_accelerator)
 
 
-def test_policy_rejects_pipeline_and_sequence_parallelism():
+def test_context_parallel_policy_preserves_preset_pack_metadata(tmp_path):
+    previous_accelerator = get_accelerator()
+    set_accelerator("cpu")
+    rendezvous = Path(tmp_path, "rendezvous")
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        meta = TwoWayPackedMeta([4, 3], [2, 5])
+        policy = Cosmos3OmniPolicy()
+        policy.set_packed_meta(meta)
+        plugin = HybridParallelPlugin(
+            tp_size=1,
+            pp_size=1,
+            sp_size=1,
+            enable_sequence_parallelism=True,
+            sequence_parallelism_mode="all_to_all",
+            precision="fp32",
+            zero_stage=0,
+            custom_policy=policy,
+            overlap_communication=False,
+            max_norm=0.0,
+        )
+        model = Cosmos3OmniTransformer()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        booster = Booster(plugin=plugin)
+        model, optimizer, _, _, _ = booster.boost(model=model, optimizer=optimizer)
+
+        processors = _processors(model)
+        assert len(processors) == 2
+        assert all(isinstance(processor, ColossalTwoWayCPAttnProcessor) for processor in processors)
+        assert all(processor.packed_meta is meta for processor in processors)
+
+        und_seq, gen_seq, rotary = _inputs()
+        outputs = model(und_seq, gen_seq, rotary)
+        loss = outputs[0].square().mean() + outputs[1].square().mean()
+        booster.backward(loss, optimizer)
+        optimizer.step()
+        assert all(parameter.grad is not None for parameter in model.parameters() if parameter.requires_grad)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        set_accelerator(previous_accelerator)
+
+
+def test_policy_rejects_pipeline_and_non_ulysses_sequence_parallelism():
     from colossalai.shardformer import ShardConfig
 
     policy = Cosmos3OmniPolicy()
@@ -186,5 +244,9 @@ def test_policy_rejects_pipeline_and_sequence_parallelism():
 
     policy.shard_config.pipeline_stage_manager = None
     policy.shard_config.enable_sequence_parallelism = True
-    with pytest.raises(NotImplementedError, match="sequence parallelism"):
+    policy.shard_config.sequence_parallelism_mode = "split_gather"
+    with pytest.raises(NotImplementedError, match="all_to_all"):
         policy.config_sanity_check()
+
+    policy.shard_config.sequence_parallelism_mode = "all_to_all"
+    policy.config_sanity_check()

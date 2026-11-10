@@ -17,7 +17,11 @@ import torch.nn as nn
 
 import colossalai.shardformer.layer as col_nn
 
-from ..modeling.cosmos3 import ColossalTwoWayAttnProcessor
+from ..modeling.cosmos3 import (
+    ColossalTwoWayAttnProcessor,
+    enable_cosmos3_context_parallel,
+    enable_cosmos3_selective_checkpointing,
+)
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
 
 __all__ = ["Cosmos3OmniPolicy"]
@@ -43,13 +47,22 @@ class Cosmos3OmniPolicy(Policy):
             ``"naive"``.
         processor (optional): A ready-made processor to install instead of building one from ``backend``. Use this to
             share a processor with code that already holds one, e.g. a script that pre-sets pack metadata.
+        selective_checkpointing (bool, optional): Recompute only the MLP half of each decoder layer and keep the
+            attention half live, instead of the whole-layer recompute of ``enable_gradient_checkpointing``. Defaults to
+            ``False``. Do not also set the model's ``gradient_checkpointing`` flag: the two nest.
 
     Raises:
         ValueError: If ``backend`` is not a known two-way kernel backend.
     """
 
-    def __init__(self, backend: str = "naive", processor: Optional[ColossalTwoWayAttnProcessor] = None) -> None:
+    def __init__(
+        self,
+        backend: str = "naive",
+        processor: Optional[ColossalTwoWayAttnProcessor] = None,
+        selective_checkpointing: bool = False,
+    ) -> None:
         super().__init__()
+        self.selective_checkpointing = selective_checkpointing
         self.processor = processor if processor is not None else ColossalTwoWayAttnProcessor(backend=backend)
 
     @property
@@ -75,10 +88,33 @@ class Cosmos3OmniPolicy(Policy):
                 "attention intact."
             )
         if self.shard_config.enable_sequence_parallelism:
-            raise NotImplementedError(
-                "Cosmos3OmniPolicy does not support sequence parallelism: the two-way flat-attention kernel consumes "
-                "whole per-sample AR and DM blocks, which a sequence split would cut across."
-            )
+            # Sequence parallelism here means Ulysses context parallelism: the sequence is split across the group,
+            # attention swaps sequence for heads, and the two-way kernel still sees whole per-sample blocks. Only the
+            # all-to-all flavour has that property; the split-gather and ring flavours cut inside a block.
+            if self.shard_config.sequence_parallelism_mode != "all_to_all":
+                raise NotImplementedError(
+                    "Cosmos3OmniPolicy supports sequence parallelism only in the 'all_to_all' (Ulysses context "
+                    f"parallel) mode, got {self.shard_config.sequence_parallelism_mode!r}."
+                )
+            if self.shard_config.enable_tensor_parallelism:
+                raise NotImplementedError(
+                    "Cosmos3OmniPolicy does not combine tensor parallelism with context parallelism yet. The "
+                    "diffusers reference composes them on a two-dimensional mesh, but this policy has not validated "
+                    "the composed local-head layout in the two-way kernel; run TP and CP separately for now."
+                )
+            if self.shard_config.fp8_communication:
+                raise NotImplementedError(
+                    "Cosmos3OmniPolicy does not implement fp8 communication for context parallelism; the Ulysses "
+                    "exchange uses the model dtype. Disable fp8_communication or run without CP."
+                )
+            cp_size = self.shard_config.sequence_parallel_size
+            num_heads, num_kv_heads = self._head_counts()
+            if num_heads % cp_size != 0 or num_kv_heads % cp_size != 0:
+                raise ValueError(
+                    f"Cosmos3 attention heads ({num_heads} query, {num_kv_heads} key/value) must be divisible by the "
+                    f"context parallel size ({cp_size}); the Ulysses exchange scatters heads across the group. This "
+                    "path does not repeat key/value heads, so a CP size larger than the KV head count is unsupported."
+                )
         unsupported = [
             flag
             for flag in ("enable_fused_normalization", "enable_flash_attention", "enable_jit_fused")
@@ -89,6 +125,11 @@ class Cosmos3OmniPolicy(Policy):
             # fused-norm / flash-attention / JIT-fused rewrites apply; better to say so than to silently skip them.
             raise NotImplementedError(
                 "Cosmos3OmniPolicy does not implement ShardFormer's " + ", ".join(unsupported) + "."
+            )
+        if self.shard_config.gradient_checkpoint_config is not None:
+            raise NotImplementedError(
+                "Cosmos3OmniPolicy uses the model's own gradient checkpointing configuration; "
+                "ShardConfig.gradient_checkpoint_config is not implemented for this policy."
             )
         if not self.shard_config.enable_tensor_parallelism:
             return
@@ -173,6 +214,17 @@ class Cosmos3OmniPolicy(Policy):
         # Runs after `_replace_module` and `_materialize`, so this is the last word on the processor: a replacement
         # pass later in the shard would drop it, which is exactly the `set_processor` timing this policy exists to
         # get right.
+        if self.shard_config.enable_sequence_parallelism:
+            # Context parallelism also owns the model's two CP seams, so it installs the processor itself.
+            context_parallel = enable_cosmos3_context_parallel(
+                self.model,
+                process_group=self.shard_config.sequence_parallel_process_group,
+                backend=self.processor.backend,
+                packed_meta=getattr(self.processor, "packed_meta", None),
+                scale=getattr(self.processor, "scale", None),
+                dropout_p=getattr(self.processor, "dropout_p", 0.0),
+            )
+            self.processor = context_parallel.processor
         installed = 0
         for module in self.model.modules():
             if module.__class__.__name__ != _ATTENTION_CLS:
@@ -184,6 +236,9 @@ class Cosmos3OmniPolicy(Policy):
                 f"Cosmos3OmniPolicy found no {_ATTENTION_CLS} module in {type(self.model).__name__}. The policy only "
                 "applies to a Cosmos 3 omni transformer; check the model passed to the booster."
             )
+        if self.selective_checkpointing:
+            # Here rather than before the boost so the patch lands on the layers as they come out of the shard pass.
+            enable_cosmos3_selective_checkpointing(self.model)
         return self.model
 
     def _head_counts(self):
