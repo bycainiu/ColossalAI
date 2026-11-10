@@ -5,14 +5,9 @@ Follows the ``action_policy_droid_nano`` recipe of nvidia/cosmos-framework, with
 Launch with::
 
     python -m torch.distributed.run --nproc_per_node=8 train_sft.py \
-        --data /path/to/Cosmos3-DROID \
-        --keep-ranges /path/to/keep_ranges_1_0_1.json \
+        --data /path/to/Cosmos3-DROID/success \
         --checkpoint /path/to/Cosmos3-Edge-Policy-DROID \
         --out /path/to/runs/cosmos3-sft
-
-Point ``--data`` at the parent directory that holds ``success/`` and ``failure/``: the recipe trains both. The
-curated ``keep_ranges_1_0_1.json`` is what the released model was trained through, and it is worth passing for
-any run whose numbers are meant to be compared with it.
 
 ``torchrun`` from a virtualenv that inherits torch from the system interpreter may resolve to that interpreter
 instead, which will not have ColossalAI importable; ``python -m torch.distributed.run`` avoids that.
@@ -76,11 +71,7 @@ LR_MULTIPLIED = ("action_proj_in", "action_proj_out", "action_modality_embed")
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--data",
-        type=Path,
-        help="DROID dataset root: the parent holding success/ and failure/ (both are trained), or one of the two.",
-    )
+    parser.add_argument("--data", type=Path, help="DROID dataset root, in LeRobot v3 layout.")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Cosmos3-Edge-Policy-DROID directory.")
     parser.add_argument("--out", type=Path, default=Path("runs/cosmos3-sft"), help="Checkpoint output directory.")
     parser.add_argument(
@@ -112,27 +103,6 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--max-episodes", type=int, help="Index only the first N episodes; the full index holds millions of windows."
-    )
-    parser.add_argument(
-        "--split",
-        default="train",
-        choices=["train", "val", "full"],
-        help="Episode-level split, seed 42 with 3%% held out -- the same permutation cosmos-framework's DROID "
-        "loader uses, so 'val' here is the set the official recipe never trains on. The recipe does not evaluate "
-        "it; 'train' is what a reproduction run wants.",
-    )
-    parser.add_argument(
-        "--success-only",
-        action="store_true",
-        help="Train on the success root alone (upstream's use_success_only). Off by default: the recipe trains "
-        "success and failure episodes together.",
-    )
-    parser.add_argument(
-        "--keep-ranges",
-        type=Path,
-        help="keep_ranges_1_0_1.json from the recipe. Indexes only the windows inside its curated frame ranges "
-        "and drops the episodes it does not mention -- about 74%% of the windows survive. Off by default: a smoke "
-        "run then needs nothing but the dataset.",
     )
     parser.add_argument(
         "--mp-context",
@@ -376,16 +346,9 @@ def main():
             resolution=args.resolution,
             augment=True,
             max_episodes=args.max_episodes,
-            split=args.split,
-            success_only=args.success_only,
-            keep_ranges=args.keep_ranges,
         )
         collate_fn = collate
-        per_shard = " ".join(f"{name}:{len(ids)}" for name, ids in dataset.split_ids.items())
-        coord.print_on_master(
-            f"[data] split={args.split} episodes {per_shard} window(s)={len(dataset)}"
-            f"{' keep_ranges=' + str(args.keep_ranges) if args.keep_ranges else ''}"
-        )
+        coord.print_on_master(f"[data] {len(dataset)} window(s)")
 
     model = build_model(args.checkpoint)
     model_config = model.config  # booster returns a wrapper, so keep the config before boosting
@@ -412,6 +375,13 @@ def main():
     )
     booster = Booster(plugin=plugin)
 
+    # One recipe video is [3, 33, 544, 736] float32, 158 MB, so a four-sample batch and the workers' prefetch queue
+    # run to tens of gigabytes of shared memory. torch's default strategy passes tensors through /dev/shm, which is
+    # 32 GB in this container and fills up at samples_per_rank=4 (the dataloader then dies with "unable to allocate
+    # shared memory ... No space left on device" long after the batch size looked fine). The file_system strategy
+    # spills the same handles to /tmp, where the disk has terabytes; override with COSMOS3_SHM_STRATEGY when /tmp is
+    # the small one on some other host.
+    torch.multiprocessing.set_sharing_strategy(os.environ.get("COSMOS3_SHM_STRATEGY", "file_system"))
     dataloader = plugin.prepare_dataloader(
         dataset,
         batch_size=args.samples_per_rank,
