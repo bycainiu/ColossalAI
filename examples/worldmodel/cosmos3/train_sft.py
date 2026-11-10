@@ -96,6 +96,21 @@ def parse_args():
         help="8 ranks x 32 samples x 32 accumulation steps = 8192, the global batch of the 256-rank recipe.",
     )
     parser.add_argument("--grad-accum", type=int, default=32)
+    parser.add_argument(
+        "--sp-size",
+        type=int,
+        default=1,
+        help="Ulysses context-parallel degree: split every packed sequence across this many ranks inside the data "
+        "parallel group. Raises the sequence length a step can hold, not the sample count.",
+    )
+    parser.add_argument(
+        "--hsdp-shard-size",
+        type=int,
+        default=None,
+        help="Hybrid sharded data parallelism: ZeRO shards, reduce-scatters and all-gathers stay inside a group of "
+        "this many data parallel ranks (one node), and only a shard-sized all-reduce crosses nodes. Defaults to "
+        "the whole data parallel group, i.e. plain ZeRO.",
+    )
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=50)
@@ -358,8 +373,15 @@ def main():
     optimizer = build_optimizer(model)
 
     # Cosmos3OmniPolicy does two things: it installs the two-way attention processor in postprocess(), after the
-    # ShardFormer module replacements so that nothing overwrites it, and with tp > 1 it applies the usual
-    # column/row-parallel rewrites. At tp = 1 it rewrites no module and only installs the processor.
+    # ShardFormer module replacements so that nothing overwrites it; with tp > 1 it applies the usual column/row
+    # parallel rewrites; and with sp > 1 it switches the processor to the Ulysses context-parallel one and wires the
+    # model's CP seams. At tp = sp = 1 it rewrites no module and only installs the processor.
+    #
+    # The launch knobs map onto the report's stack (Sec. 5.2.3): `--hsdp-shard-size` is HSDP (ZeRO sharded inside a
+    # node, replicated across nodes), `--sp-size` is Ulysses CP, and `--zero-stage`-style sharding is what the plugin
+    # does inside the shard group. Only DP is useful at 8 cards for this workload -- the VAE is 70% of the step and is
+    # per-sample inference -- but CP is what lets a step hold a longer pack, and HSDP is what keeps the 16-card run's
+    # collectives inside a node.
     #
     # custom_policy is only wired into HybridParallelPlugin -- LowLevelZero and Gemini have no such argument --
     # so the plugin has to be this one, with tp and pp at 1 and only its ZeRO in use.
@@ -368,10 +390,14 @@ def main():
     plugin = HybridParallelPlugin(
         tp_size=1,
         pp_size=1,
+        sp_size=args.sp_size,
+        enable_sequence_parallelism=args.sp_size > 1,
+        sequence_parallelism_mode="all_to_all" if args.sp_size > 1 else None,
         zero_stage=2,
         precision="bf16",
         max_norm=GRAD_CLIP,
         custom_policy=policy,
+        hsdp_shard_size=args.hsdp_shard_size,
     )
     booster = Booster(plugin=plugin)
 
