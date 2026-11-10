@@ -12,17 +12,17 @@ export RESULTS_ROOT
 export PYTHONPATH="${REPO}${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${REPO}"
 
-"${PYTHON}" examples/multimodal/cosmos3/train.py --dry-run \
+"${PYTHON}" examples/worldmodel/cosmos3_harness/train.py --dry-run \
     > "${RESULTS_ROOT}/train-dry-run.json"
 
-"${PYTHON}" examples/multimodal/cosmos3/environment_report.py \
+"${PYTHON}" examples/worldmodel/cosmos3_harness/environment_report.py \
     --output "${RESULTS_ROOT}/environment.json" \
     > "${RESULTS_ROOT}/environment.log"
 
 "${PYTHON}" - <<'PY' > "${RESULTS_ROOT}/heldout-manifest.json"
 import json
 
-from examples.multimodal.cosmos3.heldout import split_by_group, write_split_manifest
+from examples.worldmodel.cosmos3_harness.heldout import split_by_group, write_split_manifest
 
 records = [
     {"sample_id": f"{group}-{index}", "trajectory_id": group}
@@ -35,13 +35,13 @@ write_split_manifest(manifest, __import__("os").environ["RESULTS_ROOT"] + "/held
 print(json.dumps({"train": len(train_ids), "validation": len(validation_ids)}))
 PY
 
-"${PYTHON}" examples/multimodal/cosmos3/benchmark.py \
+"${PYTHON}" examples/worldmodel/cosmos3_harness/benchmark.py \
     --backend naive --device cpu --samples 1 2 --ar-len 8 --dm-len 16 \
     --heads 4 --kv-heads 2 --head-dim 8 --dtype float32 \
     --warmup 1 --iterations 2 --repeats 1 \
     --output "${RESULTS_ROOT}/benchmark.json"
 
-"${PYTHON}" examples/multimodal/cosmos3/evaluate_reasoner.py \
+"${PYTHON}" examples/worldmodel/cosmos3_harness/evaluate_reasoner.py \
     --benchmarks MMBench-Dev HallusionBench \
     --manifest "${RESULTS_ROOT}/reasoner-manifest.json" \
     > "${RESULTS_ROOT}/reasoner-manifest.log"

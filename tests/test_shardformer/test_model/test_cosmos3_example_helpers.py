@@ -7,15 +7,15 @@ import sys
 import pytest
 import torch
 
-from examples.multimodal.cosmos3.evaluate_reasoner import build_manifest, load_responses, score_choice
-from examples.multimodal.cosmos3.heldout import (
+from examples.worldmodel.cosmos3_harness.evaluate_reasoner import build_manifest, load_responses, score_choice
+from examples.worldmodel.cosmos3_harness.heldout import (
     load_split_manifest,
     split_by_group,
     split_fingerprint,
     write_split_manifest,
 )
-from examples.multimodal.cosmos3.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
-from examples.multimodal.cosmos3.train import _build_optimizer
+from examples.worldmodel.cosmos3_harness.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
+from examples.worldmodel.cosmos3_harness.train import _build_optimizer
 
 
 def _records():
@@ -188,7 +188,7 @@ def test_adamw_builder_rejects_an_unknown_mode():
 
 
 def test_operator_bench_runs_on_cpu_and_records_its_conditions(tmp_path):
-    from examples.multimodal.cosmos3 import bench_ops
+    from examples.worldmodel.cosmos3_harness import bench_ops
 
     output = tmp_path / "bench.json"
     assert (

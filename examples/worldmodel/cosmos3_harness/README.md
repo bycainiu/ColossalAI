@@ -1,8 +1,9 @@
-# Cosmos 3 training on ColossalAI
+# Cosmos 3 harness: training contract, benchmarks and evaluation
 
-This directory is the shared GPU/Ascend entry point for the next-stage Cosmos 3 work. The framework pieces live in
-`colossalai/shardformer/`; this directory owns the data contract, the loss reduction, the training loop and the
-evaluation/benchmark manifests.
+This is the shared GPU/Ascend harness for Cosmos 3. The DROID action-policy SFT recipe lives next door in
+[`../cosmos3`](../cosmos3/README.md) and owns the data pipeline (LeRobot decoding, the VAE, the prompt and the noise
+schedule); the framework pieces live in `colossalai/shardformer/`; this directory owns the data contract, the loss
+reduction, the training loop and the evaluation/benchmark manifests.
 
 ## What is supported
 
@@ -20,15 +21,15 @@ from a passing smoke run.
 
 ```bash
 export PYTHONPATH=.
-python examples/multimodal/cosmos3/train.py --dry-run
-bash examples/multimodal/cosmos3/test_ci.sh
+python examples/worldmodel/cosmos3_harness/train.py --dry-run
+bash examples/worldmodel/cosmos3_harness/test_ci.sh
 ```
 
 `--dry-run` packs two synthetic samples, checks every rewritten index, computes a velocity MSE and a token-normalised
 loss. It does not import diffusers and does not initialise a process group. Record the runtime baseline with:
 
 ```bash
-python examples/multimodal/cosmos3/environment_report.py \
+python examples/worldmodel/cosmos3_harness/environment_report.py \
     --model nvidia/Cosmos3-Edge --revision <fixed revision> \
     --output logs/cosmos3-environment.json
 ```
@@ -38,7 +39,7 @@ python examples/multimodal/cosmos3/environment_report.py \
 Produce a JSONL where every record has `sample_id` and `trajectory_id`, then:
 
 ```python
-from examples.multimodal.cosmos3.heldout import split_by_group, write_split_manifest
+from examples.worldmodel.cosmos3_harness.heldout import split_by_group, write_split_manifest
 
 train_ids, validation_ids, manifest = split_by_group(records, validation_fraction=0.1, seed=0)
 write_split_manifest(manifest, "heldout.json")
@@ -55,7 +56,7 @@ fields, and `vision_target` for this harness). The production recipe can compute
 timestep sampling; the framework contract does not change.
 
 ```bash
-torchrun --nproc_per_node=2 examples/multimodal/cosmos3/train.py \
+torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
     --model /path/to/Cosmos3-Edge \
     --replay-pack /path/to/replay-packs.pt \
     --eval-pack /path/to/heldout-packs.pt \
@@ -70,10 +71,10 @@ equivalence; a different world size reloads model/optimizer shards but is report
 ## Kernel and benchmark evidence
 
 ```bash
-python examples/multimodal/cosmos3/benchmark.py \
+python examples/worldmodel/cosmos3_harness/benchmark.py \
     --backend cuda --device cuda --samples 1 2 4 8 \
     --output logs/cosmos3-attention.json
-python examples/multimodal/cosmos3/benchmark.py \
+python examples/worldmodel/cosmos3_harness/benchmark.py \
     --backend naive --device cpu --samples 1 2 --iterations 2 --warmup 1 \
     --output /tmp/cosmos3-reference.json
 ```
@@ -85,7 +86,7 @@ OOM, not extrapolated.
 ## Reasoner evaluation
 
 ```bash
-python examples/multimodal/cosmos3/evaluate_reasoner.py \
+python examples/worldmodel/cosmos3_harness/evaluate_reasoner.py \
     --benchmarks MMBench-Dev HallusionBench \
     --model-revision <pinned revision> \
     --manifest logs/cosmos3-reasoner-manifest.json

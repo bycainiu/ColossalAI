@@ -5,7 +5,7 @@ AR/DM calls with the K/V interleave, and the complete attention processor when a
 the environment, the input shape, dtype, backend and the actual kernel path. A missing fused backend is reported,
 never silently replaced by the naive reference.
 
-    python examples/multimodal/cosmos3/benchmark.py --backend naive --samples 1 2 4 --output result.json
+    python examples/worldmodel/cosmos3_harness/benchmark.py --backend naive --samples 1 2 4 --output result.json
 """
 
 from __future__ import annotations

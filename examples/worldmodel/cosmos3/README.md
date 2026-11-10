@@ -13,6 +13,10 @@ The attention over that shared sequence is asymmetric — AR is causal, DM is bi
 the AR prefix, AR never sees DM — and is provided by `colossalai.shardformer.policies.cosmos3.Cosmos3OmniPolicy`,
 which installs a processor backed by the two-way flat-attention kernel.
 
+Benchmarks, the held-out split, the environment report and the reasoner-evaluation manifests live next door in
+`examples/worldmodel/cosmos3_harness/`. That directory also holds the replay-pack training entry point shared by the
+GPU and Ascend runs, and is where a throughput number should be measured before it is quoted here.
+
 ## What you need
 
 - An Ascend 910B host with `torch_npu`, or a CUDA host (the code reads the communication backend off the

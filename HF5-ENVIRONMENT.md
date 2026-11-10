@@ -115,7 +115,7 @@ PY
 Cosmos 3 的版本基线固定为 `torch 2.13.0 / transformers 5.17.0 / diffusers 0.35.2`。仅比较 `__version__` 不足以证明两端运行同一份 Cosmos 实现：补丁源码可以保留原版本号。两端都必须记录以下内容：
 
 ```bash
-python examples/multimodal/cosmos3/environment_report.py \
+python examples/worldmodel/cosmos3_harness/environment_report.py \
     --model nvidia/Cosmos3-Edge --revision <fixed revision> \
     --output logs/cosmos3-environment.json
 ```

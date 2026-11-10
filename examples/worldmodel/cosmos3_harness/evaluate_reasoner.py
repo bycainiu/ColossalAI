@@ -5,7 +5,7 @@ the scorer here would produce a number that cannot be compared with the model ca
 validates a benchmark manifest. The actual run is delegated to the repository's VLMEvalKit environment; the manifest
 is the part both devices must share.
 
-    python examples/multimodal/cosmos3/evaluate_reasoner.py --manifest manifest.json
+    python examples/worldmodel/cosmos3_harness/evaluate_reasoner.py --manifest manifest.json
 """
 
 from __future__ import annotations

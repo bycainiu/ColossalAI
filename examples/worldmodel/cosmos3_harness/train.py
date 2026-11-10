@@ -9,13 +9,18 @@ packer-shaped sample dictionaries, exactly the input of
 Only the ``BF16 + DP/ZeRO + tp=pp=sp=1`` path is in scope. Tensor, pipeline and sequence parallelism are not
 validated for Cosmos 3, and the policy rejects PP/SP.
 
+This is the harness half of the Cosmos 3 examples. The DROID action-policy SFT recipe lives next door in
+``examples/worldmodel/cosmos3`` and owns the data pipeline (LeRobot decoding, the VAE, the prompt and the noise
+schedule); this directory owns the batch contract, the benchmarks and the evaluation manifests, and runs on either
+GPU or Ascend.
+
 Run a CPU-only contract check (no diffusers, no distributed):
 
-    python examples/multimodal/cosmos3/train.py --dry-run
+    python examples/worldmodel/cosmos3_harness/train.py --dry-run
 
 Launch a real run on two H20 GPUs:
 
-    torchrun --nproc_per_node=2 examples/multimodal/cosmos3/train.py \
+    torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
         --model /path/to/Cosmos3-Edge --replay-pack /path/to/replay-packs.pt \
         --backend cuda --zero-stage 2 --steps 100 --save-dir /path/to/run
 """
@@ -34,8 +39,8 @@ from colossalai.shardformer.modeling.cosmos3 import clear_cosmos3_packed_meta, s
 from colossalai.shardformer.modeling.cosmos_mot import Cosmos3PackedBatch, pack_cosmos3_samples, two_way_varlen_summary
 
 try:
-    from examples.multimodal.cosmos3.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
-    from examples.multimodal.cosmos3.optim import build_adamw
+    from examples.worldmodel.cosmos3_harness.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
+    from examples.worldmodel.cosmos3_harness.optim import build_adamw
 except ImportError:  # direct execution from the example directory
     from loss import combine_modality_losses, normalise_packed_loss, velocity_mse
     from optim import build_adamw
@@ -280,7 +285,7 @@ def _write_bench_report(
     if not timings:
         raise SystemExit("--bench-json needs more steps than --bench-warmup")
     try:
-        from examples.multimodal.cosmos3.bench_ops import collect_env
+        from examples.worldmodel.cosmos3_harness.bench_ops import collect_env
     except ImportError:  # direct execution from the example directory
         from bench_ops import collect_env
 

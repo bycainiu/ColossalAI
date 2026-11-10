@@ -6,10 +6,10 @@ environment block (git commit, torch/torch_npu/CANN versions, device) and the ex
 different arms, builds or backends are comparable.
 
     # Local smoke test (CPU).
-    python examples/multimodal/cosmos3/bench_ops.py --op all --device cpu --num-tensors 8 --numel 4096
+    python examples/worldmodel/cosmos3_harness/bench_ops.py --op all --device cpu --num-tensors 8 --numel 4096
 
     # On the box, with the shard geometry of the real ZeRO-2 step.
-    python examples/multimodal/cosmos3/bench_ops.py --op all --device npu \
+    python examples/worldmodel/cosmos3_harness/bench_ops.py --op all --device npu \
         --num-tensors 512 --numel 131072 --output bench-optimizer.json
 
 The end-to-end step benchmark lives in ``train.py --bench-json``: it reuses the real training loop, so it cannot
@@ -184,7 +184,7 @@ def _bench_unscale_clip(args: argparse.Namespace, device: torch.device) -> Dict:
 
 def _bench_adamw(args: argparse.Namespace, device: torch.device) -> Dict:
     try:
-        from examples.multimodal.cosmos3.optim import build_adamw
+        from examples.worldmodel.cosmos3_harness.optim import build_adamw
     except ImportError:  # direct execution from the example directory
         from optim import build_adamw
 

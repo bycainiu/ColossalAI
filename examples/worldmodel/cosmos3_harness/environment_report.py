@@ -4,7 +4,7 @@ Versions alone do not identify the code that runs: a checkout can carry a patche
 same ``__version__``. This report records the distribution version, the module path, a content hash for the files that
 implement Cosmos attention, the checkpoint revision if given, and the capabilities the pinned Torch build exposes.
 
-    python examples/multimodal/cosmos3/environment_report.py --output logs/cosmos3-env.json
+    python examples/worldmodel/cosmos3_harness/environment_report.py --output logs/cosmos3-env.json
 """
 
 from __future__ import annotations
