@@ -704,6 +704,7 @@ class HybridParallelZeroOptimizer(LowLevelZeroOptimizer):
         partition_grad: bool = False,  # stage 2 flag
         cpu_offload: bool = False,  # cpu offload
         dp_process_group: Optional[ProcessGroup] = None,  # the dp pg for comm
+        replica_group: Optional[ProcessGroup] = None,  # the HSDP replica pg for the second-level grad all-reduce
         tp_process_group: Optional[ProcessGroup] = None,  # if using tp
         pp_process_group: Optional[ProcessGroup] = None,  # if using pp
         forced_dtype: Optional[torch.dtype] = None,
@@ -737,6 +738,7 @@ class HybridParallelZeroOptimizer(LowLevelZeroOptimizer):
             partition_grad=partition_grad,
             cpu_offload=cpu_offload,
             dp_process_group=dp_process_group,
+            replica_group=replica_group,
             forced_dtype=forced_dtype,
             overlap_allgather=overlap_allgather,
             fp8_communication=fp8_communication,
@@ -950,6 +952,10 @@ class HybridParallelPlugin(PipelinePluginBase):
         make_vocab_size_divisible_by (int, optional): it's used when padding the vocabulary size, to make it choose an faster kenel. Default to 64.
         fp8_communication (bool, optional): Whether to enable fp8 communication. Defaults to False.
         use_fp8 (bool, optional): Whether to enable fp8 mixed precision training. Defaults to False.
+        hsdp_shard_size (int, optional): Size of the group ZeRO shards (and reduce-scatters) inside, i.e. hybrid
+            sharded data parallelism. The data parallel group is cut into `hsdp_shard_size` contiguous shards, and
+            gradients are summed across the resulting replica groups with a second, shard-sized all-reduce. Leave it
+            at None to shard across the whole data parallel group, as plain ZeRO does. Defaults to None.
         overlap_p2p (bool, optional): Whether to overlap the p2p communication in pipeline parallelism
         inner_ring_size (int, optional): The inner ring size of 2D Ring Attention when sp mode is "ring_attn".
             It's advisable to not tune this (especially in single-node settings) and let it be heuristically set based on topology by default.
@@ -1004,6 +1010,7 @@ class HybridParallelPlugin(PipelinePluginBase):
         fp8_communication: bool = False,
         use_fp8: bool = False,
         inner_ring_size: int = None,
+        hsdp_shard_size: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.logger = get_dist_logger()
@@ -1044,6 +1051,7 @@ class HybridParallelPlugin(PipelinePluginBase):
                 sp_size == 1 or sp_size is None
             ), f"You should not set sp_size when sequence parallelism is not enabled."
             self.sp_size = 1
+            self.sequence_parallelism_mode = None
 
         self.tp_size = tp_size
         self.pp_size = pp_size
@@ -1160,6 +1168,26 @@ class HybridParallelPlugin(PipelinePluginBase):
         else:
             self.mixed_dp_group = self.dp_group
 
+        # Hybrid sharded data parallelism: keep the parameter-sized gradient collective inside a node and pay only a
+        # shard-sized all-reduce across nodes. Without `hsdp_shard_size` the whole data parallel group is one shard
+        # group, which is exactly what ZeRO already did, so nothing changes.
+        self.dp_shard_size = self.dp_size if hsdp_shard_size is None else hsdp_shard_size
+        if self.dp_shard_size < 1 or self.dp_size % self.dp_shard_size != 0:
+            raise ValueError(
+                f"hsdp_shard_size ({self.dp_shard_size}) must divide the data parallel size ({self.dp_size})."
+            )
+        self.dp_replicate_size = self.dp_size // self.dp_shard_size
+        if self.dp_replicate_size > 1:
+            if self.zero_stage == 0:
+                self.logger.warning(
+                    "hsdp_shard_size only affects the ZeRO gradient reduction; with zero_stage=0 the run stays plain "
+                    "DDP over the whole data parallel group.",
+                    ranks=[0],
+                )
+            self.shard_group, self.replica_group = self._create_hsdp_groups(self.dp_shard_size)
+        else:
+            self.shard_group, self.replica_group = self.mixed_dp_group, None
+
         self.shard_config = ShardConfig(
             tensor_parallel_process_group=self.tp_group,
             sequence_parallel_process_group=self.sp_group,
@@ -1170,7 +1198,7 @@ class HybridParallelPlugin(PipelinePluginBase):
             enable_flash_attention=self.enable_flash_attention,
             enable_jit_fused=self.enable_jit_fused,
             enable_sequence_parallelism=enable_sequence_parallelism,
-            sequence_parallelism_mode=sequence_parallelism_mode,
+            sequence_parallelism_mode=self.sequence_parallelism_mode,
             parallel_output=parallel_output,
             make_vocab_size_divisible_by=make_vocab_size_divisible_by,
             gradient_checkpoint_config=gradient_checkpoint_config,
@@ -1247,6 +1275,46 @@ class HybridParallelPlugin(PipelinePluginBase):
 
     def control_checkpoint_io(self) -> bool:
         return True
+
+    def _create_hsdp_groups(self, shard_size: int) -> Tuple[ProcessGroup, ProcessGroup]:
+        """Create the shard and replica groups of hybrid sharded data parallelism.
+
+        The data parallel group is the cartesian product of the dp and sp axes. Its members, read in mesh order, are
+        cut into contiguous `shard_size` shards: a shard group is the unit ZeRO partitions, reduce-scatters and
+        all-gathers inside, so keeping it inside a node keeps those collectives off the inter-node fabric. The rank at
+        the same offset of every shard forms a replica group, over which the second-level gradient all-reduce runs.
+
+        Every rank creates all of the groups in the same order, which is what ``dist.new_group`` requires; a rank only
+        keeps the two groups it belongs to.
+
+        Args:
+            shard_size (int): Number of data parallel ranks that share one sharded copy of the model.
+
+        Returns:
+            Tuple[ProcessGroup, ProcessGroup]: The shard group and the replica group of this rank.
+        """
+        mesh_shape = self.pg_mesh.shape
+        axes = [self.dp_axis, self.sp_axis]
+        reduced_shape = list(mesh_shape)
+        for axis in axes:
+            reduced_shape[axis] = 1
+        indices = [list(range(mesh_shape[axis])) for axis in axes]
+        my_rank = dist.get_rank()
+        shard_group = replica_group = None
+        for base_coord in np.ndindex(*reduced_shape):
+            coords = ProcessGroupMesh.get_coords_along_axis(base_coord, axes, indices)
+            ranks = [ProcessGroupMesh.ravel(coord, mesh_shape) for coord in coords]
+            shards = [ranks[start : start + shard_size] for start in range(0, len(ranks), shard_size)]
+            for shard in shards:
+                group = dist.new_group(shard)
+                if my_rank in shard:
+                    shard_group = group
+            for offset in range(shard_size):
+                replica_ranks = [shard[offset] for shard in shards]
+                group = dist.new_group(replica_ranks)
+                if my_rank in replica_ranks:
+                    replica_group = group
+        return shard_group, replica_group
 
     def configure(
         self,
@@ -1330,7 +1398,8 @@ class HybridParallelPlugin(PipelinePluginBase):
                     model,
                     use_pipeline=self.enable_pipeline_parallelism,
                     param_info=param_info,
-                    dp_process_group=self.mixed_dp_group,
+                    dp_process_group=self.shard_group,
+                    replica_group=self.replica_group,
                     tp_process_group=self.tp_group,
                     pp_process_group=self.pp_group,
                     verbose=True,
@@ -1456,7 +1525,7 @@ class HybridParallelPlugin(PipelinePluginBase):
 
     def get_checkpoint_io(self) -> CheckpointIO:
         return HybridParallelCheckpointIO(
-            self.mixed_dp_group, self.pp_group, self.tp_group, self.sp_group, self.zero_stage
+            self.shard_group, self.pp_group, self.tp_group, self.sp_group, self.zero_stage, replica_group=self.replica_group
         )
 
     def no_sync(self, model: Module, optimizer: OptimizerWrapper) -> Iterator[None]:
