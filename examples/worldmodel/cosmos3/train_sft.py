@@ -25,6 +25,8 @@ import argparse
 import importlib
 import json
 import os
+import sys
+import time
 from pathlib import Path
 
 import torch
@@ -38,6 +40,26 @@ from colossalai.booster.plugin import HybridParallelPlugin
 from colossalai.cluster import DistCoordinator
 from colossalai.nn.optimizer import HybridAdam
 from colossalai.shardformer.policies.cosmos3 import Cosmos3OmniPolicy
+
+try:
+    from examples.worldmodel.cosmos3_harness.training_metrics import (
+        AnomalyDetector,
+        ConsoleObserver,
+        Stopwatch,
+        TrainingMetrics,
+        WandbObserver,
+        device_memory_gib,
+    )
+except ImportError:  # direct execution from the example directory
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "cosmos3_harness"))
+    from training_metrics import (
+        AnomalyDetector,
+        ConsoleObserver,
+        Stopwatch,
+        TrainingMetrics,
+        WandbObserver,
+        device_memory_gib,
+    )
 
 # --- Recipe constants, from action_policy_droid_nano. Not exposed as flags on purpose. ------------------------
 LR = 2.0e-04  # paired with a global batch of 8192
@@ -114,6 +136,20 @@ def parse_args():
     parser.add_argument("--max-iter", type=int, default=10000)
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument(
+        "--metrics-dir",
+        type=Path,
+        help="Directory for the per-rank JSONL metrics; defaults to <out>/metrics.",
+    )
+    parser.add_argument("--metrics-every", type=int, default=10, help="Aggregate metrics every N optimizer steps.")
+    parser.add_argument("--wandb-project", help="Log the aggregated metrics to Weights & Biases from rank 0.")
+    parser.add_argument(
+        "--wandb-mode",
+        default="offline",
+        choices=("offline", "online", "disabled"),
+        help="W&B mode; offline (the default) writes the run locally and can be synced later.",
+    )
+    parser.add_argument("--wandb-run-name", help="W&B run name; defaults to W&B's generated name.")
 
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
@@ -527,8 +563,8 @@ def main():
     # patch lands on the layers as they come out of the shard pass. At tp = sp = 1 with full checkpointing it rewrites
     # no module and only installs the processor.
     #
-    # The launch knobs map onto the report's stack (Sec. 5.2.3): `--hsdp-shard-size` is HSDP (ZeRO sharded inside a
-    # node, replicated across nodes), `--sp-size` is Ulysses CP, and `--zero-stage`-style sharding is what the plugin
+    # The three launch knobs map onto the report's stack (Sec. 5.2.3): `--hsdp-shard-size` is HSDP (ZeRO sharded inside
+    # a node, replicated across nodes), `--sp-size` is Ulysses CP, and `--zero-stage`-style sharding is what the plugin
     # does inside the shard group. Only DP is useful at 8 cards for this workload -- the VAE is 70% of the step and is
     # per-sample inference -- but CP is what lets a step hold a longer pack, and HSDP is what keeps the 16-card run's
     # collectives inside a node.
@@ -590,40 +626,126 @@ def main():
     model.train()
     step = 0
     async_save_dirs = []
+
+    try:
+        device_capacity_gib = torch.npu.get_device_properties(torch.npu.current_device()).total_memory / 2**30
+    except Exception:
+        device_capacity_gib = None
+    aggregate_observers = [ConsoleObserver()]
+    if args.wandb_project and args.wandb_mode != "disabled":
+        aggregate_observers.append(WandbObserver(args.wandb_project, args.wandb_run_name, mode=args.wandb_mode))
+    metrics = TrainingMetrics(
+        out_dir=args.metrics_dir or (args.out / "metrics"),
+        rank=coord.rank,
+        world_size=coord.world_size,
+        log_every=args.metrics_every,
+        aggregate_observers=aggregate_observers,
+        detector=AnomalyDetector(device_capacity_gib=device_capacity_gib),
+    )
+    metrics.start(
+        {
+            "args": dict(vars(args)),
+            "env": {
+                "torch": torch.__version__,
+                "torch_npu": getattr(importlib.import_module("torch_npu"), "__version__", "unknown"),
+                "device": torch.npu.get_device_name(torch.npu.current_device()),
+            },
+            "world_size": coord.world_size,
+            "topology": {"sp_size": args.sp_size, "hsdp_shard_size": args.hsdp_shard_size},
+            "checkpoint": args.checkpoint,
+            "data": args.data,
+        }
+    )
+    watch = Stopwatch()
+    last_step_end = None
+    micro_window_ms = 0.0
+    micro_window_count = 0
     for it, batch in enumerate(dataloader):
+        wait_ms = None if last_step_end is None else (time.perf_counter() - last_step_end) * 1e3
+        iteration_start = time.perf_counter()
+        will_step = (it + 1) % args.grad_accum == 0
+        record_now = will_step and ((step + 1) % args.metrics_every == 0 or step + 1 == 1)
+        print_now = will_step and ((step + 1) % args.log_every == 0 or step + 1 == 1)
+        watch.reset(enabled=record_now)
         # pack_batch installs the per-sample boundaries on the policy itself; see its docstring for why they are
         # not handed back to be installed here.
-        inputs, targets = pack_batch(
-            batch,
-            vae,
-            tokenizer,
-            model_config,
-            policy=policy,
-            num_frames=args.chunk_length + 1,
-            fps=args.fps,
-            resolution=args.resolution,
-            device=torch.npu.current_device(),
-        )
+        with watch.section("data"):
+            inputs, targets = pack_batch(
+                batch,
+                vae,
+                tokenizer,
+                model_config,
+                policy=policy,
+                num_frames=args.chunk_length + 1,
+                fps=args.fps,
+                resolution=args.resolution,
+                device=torch.npu.current_device(),
+                stopwatch=watch,
+            )
         if it == 0:
             meta = policy.packed_meta
             coord.print_on_master(
                 f"[pack] samples={meta.num_samples} AR={meta.total_ar_tokens} DM={meta.total_dm_tokens} "
                 f"backend={policy.processor.backend}"
             )
-        out = model(**inputs)
-        loss = compute_loss(out, targets) / args.grad_accum
-        booster.backward(loss, optimizer)
+        with watch.section("forward"):
+            out = model(**inputs)
+        raw_loss, components = compute_loss(out, targets, return_components=True)
+        loss = raw_loss / args.grad_accum
+        with watch.section("backward"):
+            booster.backward(loss, optimizer)
 
-        if (it + 1) % args.grad_accum == 0:
+        if will_step:
             if args.async_save:
                 # The writers read a pinned host copy of the weights; this waits for that copy to finish, not for the
                 # disk, so the step below is free to overwrite the weights. A no-op when nothing is being written.
                 booster.checkpoint_io.synchronize()
-            optimizer.step()
+            with watch.section("optim"):
+                optimizer.step()
             optimizer.zero_grad()
             step += 1
-            if step % args.log_every == 0 or step == 1:
-                coord.print_on_master(f"[step {step}] loss {loss.item() * args.grad_accum:.6f}")
+            micro_window_ms += (time.perf_counter() - iteration_start) * 1e3
+            micro_window_count += 1
+            if record_now or print_now:
+                # One device sync for the whole loss decomposition; the stopwatch events queued before it are
+                # complete as well, so read_ms() below does not add a second one.
+                stacked = torch.stack([raw_loss.detach(), *components.values()]).tolist()
+                loss_value = stacked[0]
+                component_values = dict(zip(components.keys(), stacked[1:]))
+            if print_now:
+                coord.print_on_master(
+                    f"[step {step}] loss {loss_value:.6f} "
+                    f"(v {component_values['vision']:.4f} a {component_values['action']:.4f})"
+                )
+            if record_now:
+                timings = watch.read_ms()
+                packed = policy.packed_meta
+                get_grad_norm = getattr(optimizer, "get_grad_norm", None)
+                metrics.step(
+                    step,
+                    data={
+                        "samples": len(batch["task"]),
+                        "ar_tokens": packed.total_ar_tokens,
+                        "dm_tokens": packed.total_dm_tokens,
+                        "wait_ms": wait_ms,
+                        "pack_ms": timings.get("data"),
+                        "vae_ms": timings.get("vae"),
+                    },
+                    loss={"total": loss_value, **component_values},
+                    perf={
+                        "step_ms": micro_window_ms / max(micro_window_count, 1),
+                        "forward_ms": timings.get("forward"),
+                        "backward_ms": timings.get("backward"),
+                        "optim_ms": timings.get("optim"),
+                    },
+                    optim={
+                        "grad_norm": get_grad_norm() if get_grad_norm is not None else None,
+                        "lr": LR,
+                    },
+                    mem=device_memory_gib(),
+                )
+            micro_window_ms = 0.0
+            micro_window_count = 0
             if step % args.save_every == 0:
                 save_dir = args.out / f"step-{step}"
                 booster.save_model(
@@ -636,6 +758,10 @@ def main():
                     fix_checkpoint_modes(save_dir, coord)
             if step >= args.max_iter:
                 break
+
+        last_step_end = time.perf_counter()
+
+    metrics.finish({"steps": step})
 
     if async_save_dirs:
         booster.checkpoint_io._sync_io()

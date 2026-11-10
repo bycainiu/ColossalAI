@@ -22,6 +22,7 @@ mismatch that produces a plausible loss curve instead of an error.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 
@@ -470,6 +471,7 @@ def pack_batch(
     resolution: str = "480",
     device="npu:0",
     generator=None,
+    stopwatch=None,
 ):
     """Pack a batch of samples into one sequence and install the per-sample boundaries on the policy.
 
@@ -501,6 +503,8 @@ def pack_batch(
         resolution (str, optional): Key into :data:`RF_SHIFT`. Defaults to "480".
         device: Device for the packed tensors.
         generator (torch.Generator, optional): CPU generator. Defaults to None.
+        stopwatch (Stopwatch, optional): Records the VAE encode as its own section, so the pack cost can be
+            split into encode and layout. Pass the training loop's stopwatch. Defaults to None.
 
     Returns:
         tuple: ``(inputs, targets)``.
@@ -517,9 +521,11 @@ def pack_batch(
         if vae is None:
             raise ValueError("The batch carries no latent and no VAE was provided; supply one or the other.")
         # The VAE can only run in the main process, since workers cannot touch the device. Encode the batch in one
-        # call and slice it per sample afterwards.
-        with torch.no_grad():
-            out = vae.encode(batch["video"].to(device, torch.float32))
+        # call and slice it per sample afterwards. The video follows the encoder's own dtype, so a half-precision VAE
+        # is not forced to spend the encode casting every activation back up to fp32.
+        encode = stopwatch.section("vae") if stopwatch is not None else contextlib.nullcontext()
+        with torch.no_grad(), encode:
+            out = vae.encode(batch["video"].to(device, next(vae.parameters()).dtype))
             dist = getattr(out, "latent_dist", None)
             if dist is not None:
                 latent = dist.mode()
@@ -632,7 +638,7 @@ def pack_batch(
     return packed, targets
 
 
-def compute_loss(out, targets):
+def compute_loss(out, targets, return_components: bool = False):
     """Flow-matching loss over the vision and action modalities.
 
     Written against model/generator/algorithm/loss/flow_matching.py::compute_flow_matching_loss::
@@ -655,9 +661,11 @@ def compute_loss(out, targets):
     Args:
         out: The transformer output, with ``sample`` and ``action`` lists.
         targets (dict): The targets from :func:`pack_batch`.
+        return_components (bool, optional): Also return the two weighted terms, detached, for logging. They
+            sum to the scalar. Defaults to False.
 
     Returns:
-        torch.Tensor: The scalar loss.
+        torch.Tensor or tuple: The scalar loss, or ``(loss, {"vision": term, "action": term})``.
 
     Raises:
         ValueError: If the model returned no vision or action predictions.
@@ -681,4 +689,9 @@ def compute_loss(out, targets):
             for pred, target, mask in zip(out.action, targets["action"], targets["action_noisy_mask"])
         ]
     ).mean()
-    return vision * VISION_LOSS_SCALE + action * ACTION_LOSS_WEIGHT
+    vision_term = vision * VISION_LOSS_SCALE
+    action_term = action * ACTION_LOSS_WEIGHT
+    total = vision_term + action_term
+    if return_components:
+        return total, {"vision": vision_term.detach(), "action": action_term.detach()}
+    return total
