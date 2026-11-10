@@ -83,6 +83,23 @@ The JSON records the environment, shape, backend, p50/p95 latency, K/V interleav
 the naive and fused cases with the same tensors and token budget before quoting a ratio. A naive OOM is recorded as an
 OOM, not extrapolated.
 
+The optimizer arms and the end-to-end step have their own harnesses. Both report the same `env` / `conditions` /
+`results` JSON and take the environment block from `bench_ops.collect_env`, so their numbers are comparable:
+
+```bash
+python examples/worldmodel/cosmos3_harness/bench_ops.py --op all --device npu \
+    --num-tensors 432 --numel 400000 --output logs/cosmos3-ops.json
+torchrun --nproc_per_node=8 examples/worldmodel/cosmos3_harness/train.py \
+    --model /path/to/Cosmos3-Edge --replay-pack /path/to/bench-packs.pt --save-dir /tmp/bench \
+    --backend npu --precision bf16 --zero-stage 2 --steps 40 --bench-warmup 10 \
+    --bench-json logs/cosmos3-step.json
+```
+
+`bench_ops.py` measures `plain` / `foreach` / `fused` AdamW and `HybridAdam` on a synthetic parameter set of the
+chosen shard geometry, plus the unscale/clip path before and after the multi-tensor change. `--bench-json` times the
+real step and drops the first `--bench-warmup` steps. A change is accepted only when the median and the minimum both
+improve; the per-step samples are kept in the JSON so a bimodal run is visible.
+
 ## Reasoner evaluation
 
 ```bash
