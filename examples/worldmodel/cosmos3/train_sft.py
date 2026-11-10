@@ -132,6 +132,31 @@ def parse_args():
         help="Two-way attention backend. 'naive' is the PyTorch reference: it materializes the full score matrix "
         "and runs out of memory at the recipe's sequence length, so it is for numerical comparison only.",
     )
+    parser.add_argument(
+        "--checkpoint-mode",
+        default="full",
+        choices=["full", "selective", "none"],
+        help="Activation checkpointing. 'full' recomputes every decoder layer, as the recipe trains: 3.5 GiB of "
+        "activation per 480p sample. 'selective' recomputes only the two MLP blocks and keeps the attention output "
+        "alive, which is the official stack's choice -- a cheaper backward for more activation memory. 'none' keeps "
+        "every activation, 11.3 GiB per sample, and a single 910B2 then holds two of them.",
+    )
+    parser.add_argument(
+        "--compile-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="torch.compile every decoder layer with fullgraph=True and dynamic=True, as the official stack does. Off "
+        "by default: the compile has to be paid on the first step and this step is short, so it only pays off once "
+        "the artifacts are cached across runs.",
+    )
+    parser.add_argument(
+        "--async-save",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write checkpoints from background threads so the step after a save does not wait for the disk. The "
+        "weights are copied to pinned host memory before the next optimizer step, so the writers always read a "
+        "stable copy.",
+    )
     args = parser.parse_args()
     if args.data is None and args.latents is None:
         parser.error("one of --data or --latents is required")
@@ -334,6 +359,19 @@ def latent_collate(batch):
     }
 
 
+def fix_checkpoint_modes(save_dir: Path, coord: DistCoordinator):
+    """Make a finished checkpoint readable by the rest of the group.
+
+    safetensors' save_file bypasses the umask and writes 0600, so a checkpoint saved by one user is unreadable to
+    everyone else until the modes are fixed up. With an async save the files do not exist yet at the call site, which
+    is why this runs only once the writers are joined.
+    """
+    if not coord.is_master():
+        return
+    for p in save_dir.rglob("*"):
+        os.chmod(p, 0o664 if p.is_file() else 0o775)
+
+
 def main():
     args = parse_args()
 
@@ -366,16 +404,21 @@ def main():
         coord.print_on_master(f"[data] {len(dataset)} window(s)")
 
     model = build_model(args.checkpoint)
+    if args.checkpoint_mode == "full":
+        # diffusers checkpoints every entry of `self.layers`; the AR tower's layers are frozen but still recomputed.
+        model.enable_gradient_checkpointing()
     model_config = model.config  # booster returns a wrapper, so keep the config before boosting
     tokenizer = build_tokenizer(args.checkpoint)
     if not args.latents:
         vae = build_vae(args.checkpoint).to(torch.npu.current_device())
     optimizer = build_optimizer(model)
 
-    # Cosmos3OmniPolicy does two things: it installs the two-way attention processor in postprocess(), after the
+    # Cosmos3OmniPolicy does three things: it installs the two-way attention processor in postprocess(), after the
     # ShardFormer module replacements so that nothing overwrites it; with tp > 1 it applies the usual column/row
     # parallel rewrites; and with sp > 1 it switches the processor to the Ulysses context-parallel one and wires the
-    # model's CP seams. At tp = sp = 1 it rewrites no module and only installs the processor.
+    # model's CP seams. With `--checkpoint-mode selective` it also patches each decoder layer's forward there, so the
+    # patch lands on the layers as they come out of the shard pass. At tp = sp = 1 with full checkpointing it rewrites
+    # no module and only installs the processor.
     #
     # The launch knobs map onto the report's stack (Sec. 5.2.3): `--hsdp-shard-size` is HSDP (ZeRO sharded inside a
     # node, replicated across nodes), `--sp-size` is Ulysses CP, and `--zero-stage`-style sharding is what the plugin
@@ -385,7 +428,9 @@ def main():
     #
     # custom_policy is only wired into HybridParallelPlugin -- LowLevelZero and Gemini have no such argument --
     # so the plugin has to be this one, with tp and pp at 1 and only its ZeRO in use.
-    policy = Cosmos3OmniPolicy(backend=args.backend)
+    policy = Cosmos3OmniPolicy(
+        backend=args.backend, selective_checkpointing=args.checkpoint_mode == "selective"
+    )
 
     plugin = HybridParallelPlugin(
         tp_size=1,
@@ -426,8 +471,18 @@ def main():
 
     model, optimizer, _, dataloader, _ = booster.boost(model, optimizer, dataloader=dataloader)
 
+    if args.compile_blocks:
+        # Compile after boosting, not before: the policy installs the two-way attention processors in postprocess(),
+        # and torch.compile traces on the first call, so it has to see the final module graph. `dynamic=True` because
+        # the pack length varies with the samples the loader draws.
+        target = model.unwrap()
+        target.layers = torch.nn.ModuleList(
+            [torch.compile(layer, fullgraph=True, dynamic=True) for layer in target.layers]
+        )
+
     model.train()
     step = 0
+    async_save_dirs = []
     for it, batch in enumerate(dataloader):
         # pack_batch installs the per-sample boundaries on the policy itself; see its docstring for why they are
         # not handed back to be installed here.
@@ -453,6 +508,10 @@ def main():
         booster.backward(loss, optimizer)
 
         if (it + 1) % args.grad_accum == 0:
+            if args.async_save:
+                # The writers read a pinned host copy of the weights; this waits for that copy to finish, not for the
+                # disk, so the step below is free to overwrite the weights. A no-op when nothing is being written.
+                booster.checkpoint_io.synchronize()
             optimizer.step()
             optimizer.zero_grad()
             step += 1
@@ -460,14 +519,27 @@ def main():
                 coord.print_on_master(f"[step {step}] loss {loss.item() * args.grad_accum:.6f}")
             if step % args.save_every == 0:
                 save_dir = args.out / f"step-{step}"
-                booster.save_model(model, str(save_dir), shard=True, use_safetensors=True)
-                # safetensors' save_file bypasses the umask and writes 0600, so a checkpoint saved by one user is
-                # unreadable to the rest of their group until the mode is fixed up.
-                if coord.is_master():
-                    for p in save_dir.rglob("*"):
-                        os.chmod(p, 0o664 if p.is_file() else 0o775)
+                booster.save_model(
+                    model, str(save_dir), shard=True, use_safetensors=True, use_async=args.async_save
+                )
+                if args.async_save:
+                    # The files appear only once the writers are joined, which is deferred to the end of the run.
+                    async_save_dirs.append(save_dir)
+                else:
+                    fix_checkpoint_modes(save_dir, coord)
             if step >= args.max_iter:
                 break
+
+    if async_save_dirs:
+        booster.checkpoint_io._sync_io()
+        for save_dir in async_save_dirs:
+            fix_checkpoint_modes(save_dir, coord)
+
+    if os.environ.get("COSMOS3_REPORT_PEAK_HBM"):
+        # Opt-in measurement knob: the caching allocator's high-water mark on this rank's device. `npu-smi` returns
+        # nothing while the cards are busy, so this is the only reliable way to compare the checkpointing modes.
+        peak = torch.npu.max_memory_allocated() / 2**30
+        print(f"[mem rank {coord.rank}] peak allocated {peak:.2f} GiB", flush=True)
 
     coord.print_on_master("done")
 
