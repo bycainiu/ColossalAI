@@ -63,11 +63,22 @@ def _cumulative_lengths_tensor(lengths: Sequence[int], device: torch.device) -> 
     return torch.tensor(_prefix_sums(lengths), dtype=torch.int32, device=device)
 
 
-def _load_cuda_varlen_attention():
-    """Load the packed CUDA kernel lazily so importing this module never requires CUDA or Torch's varlen API."""
-    from colossalai.kernel.kernel_loader import FlashAttentionVarlenCudaLoader
+_CUDA_VARLEN_ATTENTION = None
 
-    return FlashAttentionVarlenCudaLoader().load()
+
+def _load_cuda_varlen_attention():
+    """Load the packed CUDA kernel lazily so importing this module never requires CUDA or Torch's varlen API.
+
+    The callable is cached: the processor warms it once at construction, and every decoder layer's forward would
+    otherwise rebuild the loader. The warm-up also keeps ``importlib`` out of a ``torch.compile`` region, where
+    Dynamo refuses to trace it.
+    """
+    global _CUDA_VARLEN_ATTENTION
+    if _CUDA_VARLEN_ATTENTION is None:
+        from colossalai.kernel.kernel_loader import FlashAttentionVarlenCudaLoader
+
+        _CUDA_VARLEN_ATTENTION = FlashAttentionVarlenCudaLoader().load()
+    return _CUDA_VARLEN_ATTENTION
 
 
 def _decode_cu_seqlens(value, argument_name: str) -> List[int]:

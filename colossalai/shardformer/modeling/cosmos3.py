@@ -20,7 +20,7 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 
 from ..layer._operation import gather_forward_reducescatter_backward, packed_all_to_all_single
-from ..layer.two_way_attn import TwoWayPackedMeta, two_way_flat_attention
+from ..layer.two_way_attn import TwoWayPackedMeta, _load_cuda_varlen_attention, two_way_flat_attention
 
 __all__ = [
     "ColossalTwoWayAttnProcessor",
@@ -82,6 +82,10 @@ class ColossalTwoWayAttnProcessor:
         self.backend = backend
         self.scale = scale
         self.dropout_p = dropout_p
+        # Warm the packed CUDA kernel here, not in the first forward: the loader imports through importlib, which
+        # torch.compile refuses to trace, and the processor is built before the model is compiled.
+        if backend == "cuda":
+            _load_cuda_varlen_attention()
         self.packed_meta: Optional[TwoWayPackedMeta] = None
         if packed_meta is not None:
             self.set_packed_meta(packed_meta)
