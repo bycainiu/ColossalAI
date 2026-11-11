@@ -1,4 +1,4 @@
-# Cosmos 3 Edge action-policy SFT on Ascend
+# Cosmos 3 Edge action-policy SFT on Ascend and CUDA
 
 Supervised fine-tuning of **Cosmos3-Edge-Policy-DROID** with ColossalAI, following the
 `action_policy_droid_nano` recipe of [nvidia/cosmos-framework](https://github.com/NVIDIA/cosmos-framework) with
@@ -19,8 +19,9 @@ GPU and Ascend runs, and is where a throughput number should be measured before 
 
 ## What you need
 
-- An Ascend 910B host with `torch_npu`, or a CUDA host (the code reads the communication backend off the
-  accelerator rather than hard-coding one, but it has only been run on Ascend).
+- An Ascend 910B host with `torch_npu`, or an NVIDIA GPU host with a PyTorch build that ships
+  `torch.nn.attention.varlen` (2.10 or newer, CUDA build). The code reads the communication backend off the
+  accelerator; pass `--backend npu` on Ascend and `--backend cuda` on NVIDIA.
 - The `Cosmos3-Edge-Policy-DROID` checkpoint, with its `transformer/`, `vae/` and `text_tokenizer/`
   subdirectories.
 - DROID in LeRobot v3 layout (`meta/`, `data/`, `videos/`), for the full data path.
@@ -112,7 +113,9 @@ prompt. A plain `tokenizer(task)` gives 9 tokens where this chain gives 121, whi
 index derived from it.
 
 **HF32 has to be off for the VAE.** With `torch.npu.conv.allow_hf32` left at its default, an fp32 convolution was
-measured at 210x the CPU error, which quietly corrupts the latents.
+measured at 210x the CPU error, which quietly corrupts the latents. On CUDA the same role is played by TF32, so
+`train_sft.py` turns off `torch.backends.cuda.matmul.allow_tf32` and `torch.backends.cudnn.allow_tf32` for the
+frozen encoder.
 
 ## Layout
 
@@ -159,6 +162,17 @@ Measured on one 910B2, single rank:
 | Single-sample training step through `booster` + ZeRO-2 | works, ~2.3 s/step at the recipe window |
 | Overfitting one sample, 200 steps | 6.43 -> 0.0032, a factor of 2004 |
 | Fused kernel vs the PyTorch reference, in the training loop | relative difference 2e-5 |
+
+Measured on one H20 (96 GiB), single rank, `--backend cuda`, 33-frame DROID windows:
+
+| | |
+| --- | --- |
+| 1 sample, `--num-workers 0`, 2 steps | works, 5.4 s then 3.3 s/step, peak 40.8 GiB |
+| 2 samples, `--num-workers 2` (spawn), 2 steps | works, 7.9 s then 6.2 s/step, peak 43.3 GiB |
+| `tests/test_shardformer/test_layer/test_two_way_attn.py` on the H20 | 50 passed, including the native `varlen_attn` parity test |
+
+The H20 numbers are smoke runs, not a convergence result: the crop and the noise schedule are unseeded, so the
+loss is not comparable between runs, and batch 1-2 says nothing about the recipe's throughput.
 
 ### An open question on the mRoPE temporal axis
 
