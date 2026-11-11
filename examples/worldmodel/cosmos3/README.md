@@ -171,20 +171,33 @@ Measured on one 910B2, single rank:
 | Fused kernel vs the PyTorch reference, in the training loop | relative difference 2e-5 |
 
 Measured on one H20 (96 GiB), single rank, 33-frame DROID windows from the same LeRobot success split, 2 samples
-per step, steady state after warm-up:
+per step, steady state after warm-up. Step and VAE are on the same clock: official `iter_speed`/`MethodTimer`, and
+for this recipe CUDA events in `Stopwatch`.
 
-| configuration | step | peak |
-| --- | --- | --- |
-| official `cosmos-framework`, same recipe/data (random init, compile on) | 1.80 s | n/a |
-| this recipe, defaults (fp32 VAE, full checkpointing, ZeRO-2) | 6.25 s | 43.3 GiB |
-| this recipe, `--vae-dtype float16 --checkpoint-mode selective --zero-stage 0` | 2.36 s | 38.9 GiB |
-| ... plus `--compile-blocks` | 2.2-2.4 s | 32.7 GiB |
+| configuration | step | VAE encode | peak |
+| --- | --- | --- | --- |
+| official `cosmos-framework`, same recipe/data, compile + 24/24 VAE AOT | 1.81 s | 0.986 s | 54.5 GiB |
+| this recipe, defaults (fp32 VAE, full checkpointing, ZeRO-2) | 6.25 s | n/a (wall clock) | 43.3 GiB |
+| this recipe, `--vae-dtype float16 --checkpoint-mode selective --zero-stage 0` | 2.39 s | 1.36 s | 38.9 GiB |
+| ... plus `--compile-vae-aot` | 2.16 s | 1.15 s | 38.9 GiB |
+| ... plus `--compile-blocks` | 1.99 s | 1.14 s | 33.6 GiB |
 
 The defaults are tuned for the 8-rank recipe. On one rank ZeRO-2 has no data-parallel group to shard and only adds
 collectives, the fp32 VAE is the largest single cost, and whole-layer recomputation is more than the official
-stack's `save_ops_regex=["fmha"]`; the three flags above align those choices with the official run. What remains is
-the data path: this recipe builds the prompt, tokenizes and packs in the main process, while the official loader
-does it inside its workers.
+stack's `save_ops_regex=["fmha"]`; the three flags above align those choices with the official run.
+
+`--compile-vae-aot` mirrors the framework's `compile_encode`: one `torch.export` + AOTInductor graph per (chunk
+length, spatial shape, cache pattern), a correctness gate over the latent and every returned cache tensor
+(`rtol=1e-3, atol=0.2`), and a per-variant eager fallback. It also carries the framework's two Inductor fixes
+(`emulate_precision_casts`, and the identity `AvgDown3D` shortcut), without which multi-frame variants miscompile
+on H20. All three variants for this window passed; the VAE drops 1.36 -> 1.15 s/encode. With the model compiled as
+well, step time is 1.99 s against the official 1.81 s: forward+backward+optim is 0.85 s vs the official's 0.82 s,
+so the remaining difference is the VAE implementation itself (diffusers' encoder vs the framework tokenizer), not
+the training loop.
+
+The model compile re-runs once when the packed AR length changes (step 1 85 s for VAE AOT + block compile; one
+12.6 s recompile at the first shorter prompt, then 1.99 s steady). The official pays 233 s for its first compile
+and 513 s for the 24-variant VAE AOT, both one-time.
 
 `tests/test_shardformer/test_layer/test_two_way_attn.py` on the H20: 50 passed, including the native `varlen_attn`
 parity test. The losses are not comparable between arms: the crop and the noise schedule are unseeded.
