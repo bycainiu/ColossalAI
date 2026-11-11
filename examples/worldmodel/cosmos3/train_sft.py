@@ -688,7 +688,8 @@ def main():
     last_step_end = None
     micro_window_ms = 0.0
     micro_window_count = 0
-    for it, batch in enumerate(dataloader):
+    dataloader_iter = iter(dataloader)
+    for it, batch in enumerate(dataloader_iter):
         wait_ms = None if last_step_end is None else (time.perf_counter() - last_step_end) * 1e3
         iteration_start = time.perf_counter()
         will_step = (it + 1) % args.grad_accum == 0
@@ -788,6 +789,13 @@ def main():
                 break
 
         last_step_end = time.perf_counter()
+
+    # A run that stops at --max-iter leaves the prefetch iterator alive; with persistent_workers=True its worker
+    # processes then outlive the loop, and the interpreter waits for them at exit while they still hold the device.
+    # Shut them down explicitly so the process exits and releases the GPU.
+    shutdown_workers = getattr(dataloader_iter, "_shutdown_workers", None)
+    if shutdown_workers is not None:
+        shutdown_workers()
 
     metrics.finish({"steps": step})
 
