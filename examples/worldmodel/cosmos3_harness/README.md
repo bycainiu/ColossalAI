@@ -119,6 +119,13 @@ The manifest pins the VLMEvalKit dataset name, split, language, decoding and sco
 official VLMEvalKit environment; this directory only makes the GPU and Ascend runs share one manifest and one
 per-sample response format. A subset of the General category is not a reproduction of `General Avg 59.7`.
 
+## DROID closed-loop evaluation with RoboLab
+
+[`ROBOLAB.md`](ROBOLAB.md) documents the shared GPU/NPU policy server, pinned evaluation manifest,
+official RoboLab runner, strict episode validation and paired comparison. Isaac simulation runs on an RTX GPU;
+the policy can run on a separate CUDA or Ascend host. The success metric comes from official RoboLab task
+predicates, independently of the DROID held-out training loss.
+
 ## Testing
 
 `test_ci.sh` runs the CPU-safe checks: packing/index rewriting, held-out fingerprinting, the differentiable loss
