@@ -1,6 +1,8 @@
-"""SFT for Cosmos3-Edge-Policy-DROID with ColossalAI on Ascend.
+"""SFT for Cosmos3-Edge-Policy-DROID with ColossalAI on Ascend or CUDA.
 
-Follows the ``action_policy_droid_nano`` recipe of nvidia/cosmos-framework, with Edge's model config.
+Follows the ``action_policy_droid_nano`` recipe of nvidia/cosmos-framework, with Edge's model config. The device is
+read off ``get_accelerator()``; ``--backend`` selects the two-way attention kernel that matches it (``npu`` on
+Ascend, ``cuda`` on NVIDIA).
 
 Launch with::
 
@@ -164,9 +166,10 @@ def parse_args():
     parser.add_argument(
         "--backend",
         default="npu",
-        choices=["npu", "naive"],
-        help="Two-way attention backend. 'naive' is the PyTorch reference: it materializes the full score matrix "
-        "and runs out of memory at the recipe's sequence length, so it is for numerical comparison only.",
+        choices=["npu", "naive", "cuda"],
+        help="Two-way attention backend. 'npu' is the Ascend two-call path, 'cuda' is PyTorch's native packed "
+        "varlen kernel, and 'naive' is the PyTorch reference: it materializes the full score matrix and runs out "
+        "of memory at the recipe's sequence length, so it is for numerical comparison only.",
     )
     parser.add_argument(
         "--checkpoint-mode",
@@ -310,7 +313,15 @@ def build_vae(
     """
     from diffusers import AutoencoderKLWan
 
-    torch.npu.conv.allow_hf32 = False
+    from colossalai.accelerator import get_accelerator
+
+    if get_accelerator().name == "npu":
+        # With HF32 on, an fp32 convolution on Ascend was measured at 210x the CPU error. On CUDA the analogue is
+        # TF32, so both are disabled for the frozen encoder.
+        torch.npu.conv.allow_hf32 = False
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
     vae = AutoencoderKLWan.from_pretrained(checkpoint / "vae", torch_dtype=dtype).eval()
     for p in vae.parameters():
@@ -503,15 +514,19 @@ def main():
     args = parse_args()
 
     # torch_npu registers the 'npu' device and its operators as an import side effect; no name from it is used
-    # here, so it goes through importlib rather than as an import statement nothing references.
-    importlib.import_module("torch_npu")
+    # here, so it goes through importlib rather than as an import statement nothing references. On a CUDA host the
+    # module does not exist, so the import is conditional on the accelerator.
+    from colossalai.accelerator import get_accelerator
+
+    accelerator = get_accelerator()
+    if accelerator.name == "npu":
+        importlib.import_module("torch_npu")
 
     # launch_from_torch defaults to backend='nccl', which Ascend cannot use. Reading it off the accelerator rather
     # than hard-coding 'hccl' keeps the same script runnable on a GPU host.
-    from colossalai.accelerator import get_accelerator
-
-    colossalai.launch_from_torch(backend=get_accelerator().communication_backend)
+    colossalai.launch_from_torch(backend=accelerator.communication_backend)
     coord = DistCoordinator()
+    device = accelerator.get_current_device()
 
     vae = None
     if args.latents:
@@ -543,7 +558,7 @@ def main():
             args.vae_chunk_frames,
             args.fuse_vae_norm,
             args.fast_vae_encoder,
-        ).to(torch.npu.current_device())
+        ).to(device)
         coord.print_on_master(
             f"[vae] dtype={args.vae_dtype} window={args.vae_chunk_frames or 4} frames per encoder call, "
             f"norm={'fused' if args.fuse_vae_norm else 'diffusers'}, "
@@ -628,7 +643,7 @@ def main():
     async_save_dirs = []
 
     try:
-        device_capacity_gib = torch.npu.get_device_properties(torch.npu.current_device()).total_memory / 2**30
+        device_capacity_gib = accelerator.get_device_properties(device).total_memory / 2**30
     except Exception:
         device_capacity_gib = None
     aggregate_observers = [ConsoleObserver()]
@@ -647,8 +662,12 @@ def main():
             "args": dict(vars(args)),
             "env": {
                 "torch": torch.__version__,
-                "torch_npu": getattr(importlib.import_module("torch_npu"), "__version__", "unknown"),
-                "device": torch.npu.get_device_name(torch.npu.current_device()),
+                "torch_npu": (
+                    getattr(importlib.import_module("torch_npu"), "__version__", "unknown")
+                    if accelerator.name == "npu"
+                    else "n/a"
+                ),
+                "device": accelerator.get_device_name(device),
             },
             "world_size": coord.world_size,
             "topology": {"sp_size": args.sp_size, "hsdp_shard_size": args.hsdp_shard_size},
@@ -679,7 +698,7 @@ def main():
                 num_frames=args.chunk_length + 1,
                 fps=args.fps,
                 resolution=args.resolution,
-                device=torch.npu.current_device(),
+                device=device,
                 stopwatch=watch,
             )
         if it == 0:
@@ -769,9 +788,9 @@ def main():
             fix_checkpoint_modes(save_dir, coord)
 
     if os.environ.get("COSMOS3_REPORT_PEAK_HBM"):
-        # Opt-in measurement knob: the caching allocator's high-water mark on this rank's device. `npu-smi` returns
-        # nothing while the cards are busy, so this is the only reliable way to compare the checkpointing modes.
-        peak = torch.npu.max_memory_allocated() / 2**30
+        # Opt-in measurement knob: the caching allocator's high-water mark on this rank's device. `npu-smi`/`nvidia-smi`
+        # return nothing while the cards are busy, so this is the only reliable way to compare the checkpointing modes.
+        peak = device_memory_gib().get("peak_gib", 0.0)
         print(f"[mem rank {coord.rank}] peak allocated {peak:.2f} GiB", flush=True)
 
     coord.print_on_master("done")
