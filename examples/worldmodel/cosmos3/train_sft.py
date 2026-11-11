@@ -185,9 +185,18 @@ def parse_args():
         default="full",
         choices=["full", "selective", "none"],
         help="Activation checkpointing. 'full' recomputes every decoder layer, as the recipe trains: 3.5 GiB of "
-        "activation per 480p sample. 'selective' recomputes only the two MLP blocks and keeps the attention output "
-        "alive, which is the official stack's choice -- a cheaper backward for more activation memory. 'none' keeps "
-        "every activation, 11.3 GiB per sample, and a single 910B2 then holds two of them.",
+        "activation per 480p sample. 'selective' keeps the attention half live and recomputes the MLP half, or "
+        "falls back to budgeted SAC for large packs; 'none' keeps every activation, 11.3 GiB per sample, and a "
+        "single 910B2 then holds two of them.",
+    )
+    parser.add_argument(
+        "--selective-budget-gib",
+        type=float,
+        default=8.0,
+        help="Memory budget for '--checkpoint-mode selective'. A small pack keeps the MLP-only path; a large pack "
+        "switches to the official-style SAC path, which checkpoints each layer whole and keeps the attention op "
+        "outputs of only as many layers as fit. The first forward decides from the packed token count; raise this "
+        "to save more attention recomputation, lower it when memory is tight.",
     )
     parser.add_argument(
         "--compile-blocks",
@@ -626,7 +635,9 @@ def main():
     # custom_policy is only wired into HybridParallelPlugin -- LowLevelZero and Gemini have no such argument --
     # so the plugin has to be this one, with tp and pp at 1 and only its ZeRO in use.
     policy = Cosmos3OmniPolicy(
-        backend=args.backend, selective_checkpointing=args.checkpoint_mode == "selective"
+        backend=args.backend,
+        selective_checkpointing=args.checkpoint_mode == "selective",
+        selective_budget_gib=args.selective_budget_gib,
     )
 
     plugin = HybridParallelPlugin(

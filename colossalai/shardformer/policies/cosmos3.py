@@ -50,6 +50,9 @@ class Cosmos3OmniPolicy(Policy):
         selective_checkpointing (bool, optional): Recompute only the MLP half of each decoder layer and keep the
             attention half live, instead of the whole-layer recompute of ``enable_gradient_checkpointing``. Defaults to
             ``False``. Do not also set the model's ``gradient_checkpointing`` flag: the two nest.
+        selective_budget_gib (float, optional): Memory budget for the selective checkpointing. Small packs keep the
+            MLP-only path; large packs switch to the official-style SAC path, which checkpoints the whole layer and
+            keeps the attention op outputs of only as many layers as fit. Defaults to 8.0 GiB.
 
     Raises:
         ValueError: If ``backend`` is not a known two-way kernel backend.
@@ -60,9 +63,11 @@ class Cosmos3OmniPolicy(Policy):
         backend: str = "naive",
         processor: Optional[ColossalTwoWayAttnProcessor] = None,
         selective_checkpointing: bool = False,
+        selective_budget_gib: float = 8.0,
     ) -> None:
         super().__init__()
         self.selective_checkpointing = selective_checkpointing
+        self.selective_budget_gib = selective_budget_gib
         self.processor = processor if processor is not None else ColossalTwoWayAttnProcessor(backend=backend)
 
     @property
@@ -238,7 +243,7 @@ class Cosmos3OmniPolicy(Policy):
             )
         if self.selective_checkpointing:
             # Here rather than before the boost so the patch lands on the layers as they come out of the shard pass.
-            enable_cosmos3_selective_checkpointing(self.model)
+            enable_cosmos3_selective_checkpointing(self.model, budget_gib=self.selective_budget_gib)
         return self.model
 
     def _head_counts(self):

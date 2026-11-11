@@ -17,7 +17,9 @@ from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
+
+from colossalai.logging import get_dist_logger
 
 from ..layer._operation import gather_forward_reducescatter_backward, packed_all_to_all_single
 from ..layer.two_way_attn import TwoWayPackedMeta, _load_cuda_varlen_attention, two_way_flat_attention
@@ -615,20 +617,113 @@ def _checkpointed_decoder_forward(self, und_seq, gen_seq, rotary_emb):
     return residual_und + mlp_und, residual_gen + mlp_gen
 
 
-def enable_cosmos3_selective_checkpointing(model: torch.nn.Module) -> int:
-    """Checkpoint only the MLP half of each Cosmos 3 decoder layer, keeping the attention half live.
+# Dispatched op names that carry the attention output for the backends this policy runs on: PyTorch's native packed
+# CUDA kernel, Ascend's fused attention, and the SDPA reference used by the CPU test. Anything else is recomputed.
+_ATTENTION_OP_PATTERNS = ("varlen_attn", "fmha", "npu_fusion_attention", "scaled_dot_product_attention")
 
-    The stock ``enable_gradient_checkpointing`` recomputes a whole decoder layer, attention included. This trades the
-    other way, the way the official recipe does: the attention output is kept (it is a residual-stream tensor the next
-    layer needs anyway) and only the two MLP blocks are recomputed. The MLP is where the 4x expansion lives, so it is
-    both the largest activation and the part worth freeing; recomputing it costs the MLP's FLOPs only, not the
-    attention's.
 
-    Exclusive with ``model.enable_gradient_checkpointing()``: that flag wraps the whole layer, and leaving it on
-    nests one checkpoint inside another, recomputing the MLP three times per step instead of twice.
+def _is_attention_op(func) -> bool:
+    """Whether a selective-checkpoint policy op is one whose output is worth keeping."""
+    name = getattr(func, "__name__", "")
+    return any(pattern in name for pattern in _ATTENTION_OP_PATTERNS)
+
+
+class _SelectiveBudget:
+    """Pick the selective-checkpoint path from the packed batch and a memory budget.
+
+    The old path keeps the attention half live, which retains the whole attention autograd graph and costs roughly a
+    few times one residual stream per layer. It is the faster backward, but at 32 samples it exceeds a 96 GiB card.
+    The official-style path checkpoints the whole layer and saves only the attention op outputs up to a byte budget,
+    recomputing both halves for the remaining layers. The first forward of a run decides between them and, for the
+    op-level path, how many layers may keep their attention output.
+    """
+
+    def __init__(self, budget_gib: float, num_layers: int) -> None:
+        self.budget_bytes = max(0.0, float(budget_gib)) * 2**30
+        self.num_layers = int(num_layers)
+        self.path: Optional[str] = None
+        self.max_saved_layers = 0
+
+    def decide(self, und_seq: torch.Tensor, gen_seq: torch.Tensor) -> None:
+        """Decide once per run, from the first packed batch's token count."""
+        if self.path is not None:
+            return
+        tokens = int(und_seq.shape[0]) + int(gen_seq.shape[0])
+        hidden = int(und_seq.shape[-1])
+        # bf16 attention output for both pathways; the MLP-only path additionally retains the attention graph, so its
+        # per-layer cost is estimated at 3x the residual stream.
+        residual_bytes = max(tokens * hidden * 2, 1)
+        mlp_only_bytes = self.num_layers * residual_bytes * 3
+        if mlp_only_bytes <= self.budget_bytes:
+            self.path = "mlp"
+            logger = get_dist_logger()
+            logger.info(
+                f"[selective-ac] tokens={tokens} hidden={hidden}: MLP-only path "
+                f"(estimated {mlp_only_bytes / 2**30:.1f} GiB <= budget {self.budget_bytes / 2**30:.1f} GiB)",
+                ranks=[0],
+            )
+        else:
+            self.path = "sac"
+            self.max_saved_layers = min(self.num_layers, int(self.budget_bytes / residual_bytes))
+            logger = get_dist_logger()
+            logger.info(
+                f"[selective-ac] tokens={tokens} hidden={hidden}: SAC path, keeping attention outputs for "
+                f"{self.max_saved_layers}/{self.num_layers} layers within {self.budget_bytes / 2**30:.1f} GiB",
+                ranks=[0],
+            )
+
+
+def _sac_checkpointed_decoder_forward(self, und_seq, gen_seq, rotary_emb, budget: _SelectiveBudget):
+    """Official-style SAC: checkpoint the whole layer and keep only the attention op outputs within budget."""
+    layer_index = self._colossal_layer_index
+    original_forward = self._colossal_original_forward
+
+    def run_layer(und, gen, cos_und, sin_und, cos_gen, sin_gen):
+        return original_forward(und, gen, (cos_und, sin_und, cos_gen, sin_gen))
+
+    def policy(ctx, func, *args, **kwargs):
+        # The decision is per layer, not per call: both the causal AR and the full DM attention calls in a selected
+        # layer are kept, and the remaining layers recompute both.
+        if layer_index < budget.max_saved_layers and _is_attention_op(func):
+            return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.MUST_RECOMPUTE
+
+    return checkpoint(
+        run_layer,
+        und_seq,
+        gen_seq,
+        *rotary_emb,
+        use_reentrant=False,
+        context_fn=lambda: create_selective_checkpoint_contexts(policy),
+    )
+
+
+def _selective_decoder_forward(self, und_seq, gen_seq, rotary_emb):
+    """Dispatch to the MLP-only path for small packs and to budgeted SAC for large ones."""
+    budget = self._colossal_selective_budget
+    budget.decide(und_seq, gen_seq)
+    if budget.path == "mlp":
+        return _checkpointed_decoder_forward(self, und_seq, gen_seq, rotary_emb)
+    return _sac_checkpointed_decoder_forward(self, und_seq, gen_seq, rotary_emb, budget)
+
+
+def enable_cosmos3_selective_checkpointing(model: torch.nn.Module, budget_gib: float = 8.0) -> int:
+    """Checkpoint Cosmos 3 decoder layers, adapting the saved set to the packed batch and a memory budget.
+
+    Small packs keep the original MLP-only path: the attention output is kept and only the two MLP blocks are
+    recomputed, which is the cheaper backward. When that path's estimated activation footprint would exceed
+    ``budget_gib``, the layers switch to the official-style SAC path: each layer is checkpointed whole and only the
+    attention op outputs of the first ``budget_gib / per-layer-output`` layers are kept, so the remaining layers
+    recompute attention too. This is what lets a 32-sample rank batch fit a 96 GiB card while still saving the
+    attention recompute on as many layers as the budget allows.
+
+    The decision is made on the first forward of the run, from the actual packed token count; it is stable for the
+    rest of the run. ``budget_gib=0`` forces the SAC path with nothing saved, i.e. full recompute.
 
     Args:
         model (torch.nn.Module): The Cosmos 3 transformer, wrapped or unwrapped.
+        budget_gib (float, optional): Memory budget for saved attention outputs (and, on the MLP-only path, the
+            attention graph). Defaults to 8.0 GiB.
 
     Returns:
         int: Number of decoder layers patched; zero when they all were already.
@@ -637,19 +732,22 @@ def enable_cosmos3_selective_checkpointing(model: torch.nn.Module) -> int:
         RuntimeError: If the model has no Cosmos 3 decoder layer, i.e. the patch would silently disable
             checkpointing and the step would run out of memory instead.
     """
-    seen = patched = 0
-    for module in model.modules():
-        if module.__class__.__name__ != _DECODER_LAYER_CLS:
-            continue
-        seen += 1
-        if getattr(module, "_colossal_selective_checkpointing", False):
-            continue
-        module.forward = MethodType(_checkpointed_decoder_forward, module)
-        module._colossal_selective_checkpointing = True
-        patched += 1
-    if seen == 0:
+    layers = [module for module in model.modules() if module.__class__.__name__ == _DECODER_LAYER_CLS]
+    if not layers:
         raise RuntimeError(
             f"No {_DECODER_LAYER_CLS} module found in {type(model).__name__}; selective checkpointing only applies "
             "to a Cosmos 3 omni transformer."
         )
+
+    budget = _SelectiveBudget(budget_gib, len(layers))
+    patched = 0
+    for layer_index, module in enumerate(layers):
+        if getattr(module, "_colossal_selective_checkpointing", False):
+            continue
+        module._colossal_original_forward = module.forward
+        module._colossal_selective_budget = budget
+        module._colossal_layer_index = layer_index
+        module.forward = MethodType(_selective_decoder_forward, module)
+        module._colossal_selective_checkpointing = True
+        patched += 1
     return patched

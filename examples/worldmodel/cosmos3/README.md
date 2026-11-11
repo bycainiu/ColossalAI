@@ -59,8 +59,7 @@ python -m torch.distributed.run --nproc_per_node=1 train_sft.py \
 
 At world size 1 there is no data-parallel group for ZeRO to shard, so `--zero-stage 0` (or a plain DDP plugin)
 avoids collectives that have nothing to do. `--vae-dtype float16` and `--checkpoint-mode selective` match the
-precision and the fmha-preserving recompute the official stack uses; see the H20 row in Status for the measured
-effect.
+precision and checkpointing choices of the official stack; see the H20 row in Status for the measured effect.
 
 To exercise the loop with no video and no VAE, pass `--latents` a safetensors file whose entries are
 `<name>/latent` and `<name>/action` and whose header records `canvas_hw` and `aspect_key` per clip.
@@ -183,8 +182,8 @@ for this recipe CUDA events in `Stopwatch`.
 | ... plus `--compile-blocks` | 1.99 s | 1.14 s | 33.6 GiB |
 
 The defaults are tuned for the 8-rank recipe. On one rank ZeRO-2 has no data-parallel group to shard and only adds
-collectives, the fp32 VAE is the largest single cost, and whole-layer recomputation is more than the official
-stack's `save_ops_regex=["fmha"]`; the three flags above align those choices with the official run.
+collectives, and the fp32 VAE is the largest single cost; the flags above align the VAE precision, the checkpointing
+scope and the optimizer sharding with the official run.
 
 `--compile-vae-aot` mirrors the framework's `compile_encode`: one `torch.export` + AOTInductor graph per (chunk
 length, spatial shape, cache pattern), a correctness gate over the latent and every returned cache tensor
@@ -198,6 +197,15 @@ the training loop.
 The model compile re-runs once when the packed AR length changes (step 1 85 s for VAE AOT + block compile; one
 12.6 s recompile at the first shorter prompt, then 1.99 s steady). The official pays 233 s for its first compile
 and 513 s for the 24-variant VAE AOT, both one-time.
+
+`--checkpoint-mode selective` now takes `--selective-budget-gib` (default 8). The first forward picks the path from
+the packed token count: small packs keep the MLP-only path (attention output live, MLP recomputed), while large
+packs switch to the official-style SAC path -- each layer is checkpointed whole and the attention op outputs of only
+`budget / per-layer-output` layers are kept (`MUST_SAVE` on `varlen_attn`/fmha). At a 32-sample rank batch the old
+MLP-only path OOMed at 94.3 GiB; with an 8 GiB budget SAC keeps 17/28 layers and peaks at 66.4 GiB, running
+37.7-38.4 s/step (backward 12.0 s vs 12.7 s for full). Most of that step is the VAE (21.2 s), so the SAC gain is
+small at batch 32, but the OOM is gone. Full recompute remains the faster-memory default when backward speed is not
+the target.
 
 `tests/test_shardformer/test_layer/test_two_way_attn.py` on the H20: 50 passed, including the native `varlen_attn`
 parity test. The losses are not comparable between arms: the crop and the noise schedule are unseeded.

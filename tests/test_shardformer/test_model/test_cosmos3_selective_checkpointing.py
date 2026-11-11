@@ -140,6 +140,28 @@ def test_selective_checkpointing_matches_the_stock_forward():
     assert _counters(patched) == {"attn": 2, "mlp": 8}
 
 
+def test_budgeted_sac_path_matches_and_recomputes_a_whole_layer():
+    """Forcing the SAC path with no budget must match the stock gradients and recompute both halves."""
+    torch.manual_seed(12)
+    stock = _Stack()
+    patched = copy.deepcopy(stock)
+
+    generator = torch.Generator().manual_seed(4)
+    und_seq = torch.randn(5, HIDDEN, generator=generator).requires_grad_(True)
+    gen_seq = torch.randn(4, HIDDEN, generator=generator).requires_grad_(True)
+    rotary_emb = tuple(torch.zeros(1) for _ in range(4))
+    reference = _gradients(stock, (und_seq, gen_seq, rotary_emb))
+
+    assert enable_cosmos3_selective_checkpointing(patched, budget_gib=0.0) == 2
+    got = _gradients(patched, (und_seq, gen_seq, rotary_emb))
+
+    for expected, actual in zip(reference, got):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+    # A zero budget saves nothing, so the whole layer is recomputed: attention and both MLPs run twice.
+    assert _counters(patched) == {"attn": 4, "mlp": 8}
+
+
 def test_installer_is_idempotent_and_rejects_a_foreign_model():
     model = _Stack(num_layers=3)
     assert enable_cosmos3_selective_checkpointing(model) == 3
