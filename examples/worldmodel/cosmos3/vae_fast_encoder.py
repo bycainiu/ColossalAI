@@ -23,6 +23,9 @@ import types
 import torch
 import torch.nn.functional as F
 
+# Set when ``enable_fast_avgdown`` patches the modules; None until then and for the identity case.
+_AVGDOWN_ORIGINAL_FORWARD = None
+
 
 def _fast_conv_forward(self, x, cache_x=None):
     pad_t = self._padding[4]
@@ -83,17 +86,50 @@ def enable_fast_downblock(vae, verbose: bool = False):
     return vae
 
 
+def _fast_avgdown_forward(self, x):
+    """Identity shortcut for the case Inductor miscompiles, otherwise diffusers' own forward.
+
+    ``AvgDown3D`` with ``factor_t == factor_s == 1`` and equal channel counts is a plain identity that diffusers
+    still routes through view -> permute -> contiguous -> view -> mean. Inductor's comprehensive padding can give
+    that intermediate buffer a padded layout and then read it with the wrong stride order -- the same miscompile the
+    official tokenizer fixed by returning ``x`` directly. The arithmetic of the shortcut is unchanged.
+    """
+    if self.factor_t == 1 and self.factor_s == 1 and self.in_channels == self.out_channels:
+        return x
+    return _AVGDOWN_ORIGINAL_FORWARD(self, x)
+
+
+def enable_fast_avgdown(vae, verbose: bool = False):
+    """Return ``x`` for the identity ``AvgDown3D`` shortcuts, avoiding the Inductor view/permute miscompile."""
+    global _AVGDOWN_ORIGINAL_FORWARD
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D
+
+    if _AVGDOWN_ORIGINAL_FORWARD is None:
+        _AVGDOWN_ORIGINAL_FORWARD = AvgDown3D.forward
+
+    patched = 0
+    for module in vae.modules():
+        if isinstance(module, AvgDown3D):
+            module.forward = types.MethodType(_fast_avgdown_forward, module)
+            patched += 1
+    vae.fast_avgdown_modules = patched
+    if verbose:
+        print(f"[vae] identity AvgDown3D shortcut short-circuited in {patched} module(s)", flush=True)
+    return vae
+
+
 def enable_fast_encoder(vae, verbose: bool = False):
     enable_fast_conv(vae, verbose)
     enable_fast_downblock(vae, verbose)
+    enable_fast_avgdown(vae, verbose)
     return vae
 
 
 def disable_fast_encoder(vae):
     """Restore diffusers' own forwards."""
-    from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanResidualDownBlock
+    from diffusers.models.autoencoders.autoencoder_kl_wan import AvgDown3D, WanCausalConv3d, WanResidualDownBlock
 
     for module in vae.modules():
-        if isinstance(module, (WanCausalConv3d, WanResidualDownBlock)) and "forward" in module.__dict__:
+        if isinstance(module, (AvgDown3D, WanCausalConv3d, WanResidualDownBlock)) and "forward" in module.__dict__:
             del module.__dict__["forward"]
     return vae

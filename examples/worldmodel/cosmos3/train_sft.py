@@ -224,6 +224,19 @@ def parse_args():
         "correct but measured 18x slower than eager on this encoder.",
     )
     parser.add_argument(
+        "--compile-vae-aot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile the per-chunk VAE encoder ahead of time with torch.export + AOTInductor, validate every "
+        "variant against eager (latent and every returned cache tensor), and fall back per variant, mirroring the "
+        "official tokenizer's compile_encode. Off by default; mutually exclusive with --compile-vae.",
+    )
+    parser.add_argument(
+        "--compile-vae-aot-dir",
+        type=Path,
+        help="Directory for the AOTInductor .pt2 packages; defaults to <out>/aot_vae.",
+    )
+    parser.add_argument(
         "--vae-dtype",
         default="float32",
         choices=["float32", "float16"],
@@ -274,6 +287,8 @@ def parse_args():
         parser.error("one of --data or --latents is required")
     if args.vae_chunk_frames and args.vae_chunk_frames % 4:
         parser.error("--vae-chunk-frames must be a multiple of 4")
+    if args.compile_vae and args.compile_vae_aot:
+        parser.error("--compile-vae (JIT) and --compile-vae-aot are different mechanisms; enable one.")
     return args
 
 
@@ -306,6 +321,7 @@ def build_vae(
     chunk_frames: int = 0,
     fuse_norm: bool = False,
     fast_encoder: bool = True,
+    aot_dir: Path = None,
 ):
     """Load the VAE frozen. It runs inside the training loop and never enters the booster.
 
@@ -318,7 +334,8 @@ def build_vae(
 
     ``chunk_frames`` widens the encoder call window past diffusers' four pixel frames; see ``--vae-chunk-frames``.
     ``fuse_norm`` and ``fast_encoder`` replace the two cheapest passes diffusers makes over the activation; see
-    ``--fuse-vae-norm`` and ``--fast-vae-encoder``.
+    ``--fuse-vae-norm`` and ``--fast-vae-encoder``. ``aot_dir`` compiles and validates the per-chunk encoder with
+    AOTInductor into that directory; see ``--compile-vae-aot``.
     """
     from diffusers import AutoencoderKLWan
 
@@ -338,7 +355,7 @@ def build_vae(
     if chunk_frames:
         from vae_chunked import enable_chunked_encode
 
-        enable_chunked_encode(vae, chunk_frames)
+        enable_chunked_encode(vae, chunk_frames, aot_dir=aot_dir, verbose=aot_dir is not None)
     if fuse_norm:
         from vae_fused_norm import enable_fused_rmsnorm
 
@@ -561,17 +578,22 @@ def main():
     model_config = model.config  # booster returns a wrapper, so keep the config before boosting
     tokenizer = build_tokenizer(args.checkpoint)
     if not args.latents:
+        aot_dir = None
+        if args.compile_vae_aot:
+            aot_dir = args.compile_vae_aot_dir or (args.out / "aot_vae")
         vae = build_vae(
             args.checkpoint,
             getattr(torch, args.vae_dtype),
             args.vae_chunk_frames,
             args.fuse_vae_norm,
             args.fast_vae_encoder,
+            aot_dir=aot_dir,
         ).to(device)
         coord.print_on_master(
             f"[vae] dtype={args.vae_dtype} window={args.vae_chunk_frames or 4} frames per encoder call, "
             f"norm={'fused' if args.fuse_vae_norm else 'diffusers'}, "
-            f"conv={'fast' if args.fast_vae_encoder else 'diffusers'}"
+            f"conv={'fast' if args.fast_vae_encoder else 'diffusers'}, "
+            f"aot={'on' if aot_dir is not None else 'off'}"
         )
         if args.compile_vae:
             # Compile the private encoder, not `encode`: the public method carries diffusers' forward hook. Static

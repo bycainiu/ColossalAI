@@ -25,7 +25,7 @@ import torch
 OFFICIAL_CHUNK_FRAMES = {"256": 68, "480": 24, "720": 8}
 
 
-def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int) -> torch.Tensor:
+def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int, chunk_runner=None) -> torch.Tensor:
     """``AutoencoderKLWan._encode`` with a configurable encoder-call window."""
     if chunk_frames % 4:
         raise ValueError(f"chunk_frames must be a multiple of 4, got {chunk_frames}")
@@ -48,18 +48,20 @@ def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     if ragged:
         x = torch.cat([x, x[:, :, -1:].expand(-1, -1, 4 - ragged, -1, -1)], dim=2)
 
+    if chunk_runner is None:
+
+        def run(chunk, feat_cache):
+            return vae.encoder(chunk, feat_cache=feat_cache, feat_idx=[0])
+
+    else:
+        run = chunk_runner
+
     vae._enc_conv_idx = [0]
-    out = vae.encoder(x[:, :, :1, :, :], feat_cache=vae._enc_feat_map, feat_idx=vae._enc_conv_idx)
+    out = run(x[:, :, :1, :, :], vae._enc_feat_map)
     parts = [out]
     for start in range(1, x.shape[2], chunk_frames):
         vae._enc_conv_idx = [0]
-        parts.append(
-            vae.encoder(
-                x[:, :, start : start + chunk_frames, :, :],
-                feat_cache=vae._enc_feat_map,
-                feat_idx=vae._enc_conv_idx,
-            )
-        )
+        parts.append(run(x[:, :, start : start + chunk_frames, :, :], vae._enc_feat_map))
 
     out = torch.cat(parts, 2) if len(parts) > 1 else parts[0]
     out = out[:, :, :num_latent]
@@ -68,14 +70,30 @@ def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int) -> torch.Tensor:
     return enc
 
 
-def enable_chunked_encode(vae, chunk_frames: int):
-    """Install the wider encoder call window on ``vae``. Returns the VAE so this can wrap a constructor."""
+def enable_chunked_encode(vae, chunk_frames: int, aot_dir=None, verbose: bool = False):
+    """Install the wider encoder call window on ``vae``. Returns the VAE so this can wrap a constructor.
+
+    Args:
+        vae: The Wan VAE.
+        chunk_frames: Pixel frames per encoder call, a multiple of 4. Zero keeps diffusers' own loop.
+        aot_dir (optional): When given, compile and validate the per-chunk encoder with AOTInductor into this
+            directory and dispatch to the compiled graph, falling back to eager per variant. Defaults to None,
+            i.e. eager chunks.
+        verbose (bool, optional): Print AOT compile/gate lines. Defaults to False.
+    """
     if chunk_frames <= 0:
         return vae
 
+    runner = None
+    if aot_dir is not None:
+        from vae_aot import AOTChunkRunner
+
+        runner = AOTChunkRunner(vae.encoder, save_dir=aot_dir, verbose=verbose)
+
     def _encode(x):
-        return _encode_chunked(vae, x, chunk_frames)
+        return _encode_chunked(vae, x, chunk_frames, runner)
 
     vae._encode = _encode
     vae.encode_chunk_frames = chunk_frames
+    vae._aot_chunk_runner = runner
     return vae
