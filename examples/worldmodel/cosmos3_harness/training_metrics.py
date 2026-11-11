@@ -304,6 +304,8 @@ def _events_available() -> bool:
         import torch
     except ImportError:  # pragma: no cover
         return False
+    if torch.cuda.is_available() and hasattr(torch.cuda, "Event"):
+        return True
     return hasattr(torch, "npu") and hasattr(torch.npu, "Event")
 
 
@@ -320,7 +322,8 @@ class Stopwatch:
 
     Args:
         use_events (bool, optional): Force event or wall-clock timing. Defaults to using events when the current
-            torch build exposes ``torch.npu.Event`` (falls back to wall-clock on CPU, CUDA and older builds).
+            torch build exposes ``torch.cuda.Event`` or ``torch.npu.Event`` (falls back to wall-clock on CPU and
+            older builds).
     """
 
     def __init__(self, use_events: Optional[bool] = None) -> None:
@@ -339,7 +342,10 @@ class Stopwatch:
         try:
             import torch
 
-            event = torch.npu.Event(enable_timing=True)
+            if torch.cuda.is_available():
+                event = torch.cuda.Event(enable_timing=True)
+            else:
+                event = torch.npu.Event(enable_timing=True)
             event.record()
             return event
         except Exception:
