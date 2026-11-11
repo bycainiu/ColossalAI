@@ -52,8 +52,15 @@ A short single-rank run:
 ```bash
 python -m torch.distributed.run --nproc_per_node=1 train_sft.py \
     --data ... --checkpoint ... \
-    --samples-per-rank 1 --grad-accum 1 --max-iter 60 --max-episodes 4
+    --backend cuda --zero-stage 0 \
+    --vae-dtype float16 --checkpoint-mode selective \
+    --samples-per-rank 2 --grad-accum 1 --max-iter 10 --max-episodes 8
 ```
+
+At world size 1 there is no data-parallel group for ZeRO to shard, so `--zero-stage 0` (or a plain DDP plugin)
+avoids collectives that have nothing to do. `--vae-dtype float16` and `--checkpoint-mode selective` match the
+precision and the fmha-preserving recompute the official stack uses; see the H20 row in Status for the measured
+effect.
 
 To exercise the loop with no video and no VAE, pass `--latents` a safetensors file whose entries are
 `<name>/latent` and `<name>/action` and whose header records `canvas_hw` and `aspect_key` per clip.
@@ -163,16 +170,24 @@ Measured on one 910B2, single rank:
 | Overfitting one sample, 200 steps | 6.43 -> 0.0032, a factor of 2004 |
 | Fused kernel vs the PyTorch reference, in the training loop | relative difference 2e-5 |
 
-Measured on one H20 (96 GiB), single rank, `--backend cuda`, 33-frame DROID windows:
+Measured on one H20 (96 GiB), single rank, 33-frame DROID windows from the same LeRobot success split, 2 samples
+per step, steady state after warm-up:
 
-| | |
-| --- | --- |
-| 1 sample, `--num-workers 0`, 2 steps | works, 5.4 s then 3.3 s/step, peak 40.8 GiB |
-| 2 samples, `--num-workers 2` (spawn), 2 steps | works, 7.9 s then 6.2 s/step, peak 43.3 GiB |
-| `tests/test_shardformer/test_layer/test_two_way_attn.py` on the H20 | 50 passed, including the native `varlen_attn` parity test |
+| configuration | step | peak |
+| --- | --- | --- |
+| official `cosmos-framework`, same recipe/data (random init, compile on) | 1.80 s | n/a |
+| this recipe, defaults (fp32 VAE, full checkpointing, ZeRO-2) | 6.25 s | 43.3 GiB |
+| this recipe, `--vae-dtype float16 --checkpoint-mode selective --zero-stage 0` | 2.36 s | 38.9 GiB |
+| ... plus `--compile-blocks` | 2.2-2.4 s | 32.7 GiB |
 
-The H20 numbers are smoke runs, not a convergence result: the crop and the noise schedule are unseeded, so the
-loss is not comparable between runs, and batch 1-2 says nothing about the recipe's throughput.
+The defaults are tuned for the 8-rank recipe. On one rank ZeRO-2 has no data-parallel group to shard and only adds
+collectives, the fp32 VAE is the largest single cost, and whole-layer recomputation is more than the official
+stack's `save_ops_regex=["fmha"]`; the three flags above align those choices with the official run. What remains is
+the data path: this recipe builds the prompt, tokenizes and packs in the main process, while the official loader
+does it inside its workers.
+
+`tests/test_shardformer/test_layer/test_two_way_attn.py` on the H20: 50 passed, including the native `varlen_attn`
+parity test. The losses are not comparable between arms: the crop and the noise schedule are unseeded.
 
 ### An open question on the mRoPE temporal axis
 
