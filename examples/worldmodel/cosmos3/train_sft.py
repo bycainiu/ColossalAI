@@ -237,6 +237,14 @@ def parse_args():
         help="Directory for the AOTInductor .pt2 packages; defaults to <out>/aot_vae.",
     )
     parser.add_argument(
+        "--vae-encode-batch",
+        type=int,
+        default=0,
+        help="Samples per VAE encode call. 0 encodes the whole rank batch at once; a 32-sample batch at 480p "
+        "holds every sample's encoder activations at the same time and can exhaust the card, so use 4-8 for the "
+        "recipe's per-rank batch. The official tokenizer encodes one item at a time.",
+    )
+    parser.add_argument(
         "--vae-dtype",
         default="float32",
         choices=["float32", "float16"],
@@ -732,6 +740,7 @@ def main():
                 resolution=args.resolution,
                 device=device,
                 stopwatch=watch,
+                vae_encode_batch=args.vae_encode_batch,
             )
         if it == 0:
             meta = policy.packed_meta

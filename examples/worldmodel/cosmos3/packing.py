@@ -472,6 +472,7 @@ def pack_batch(
     device="npu:0",
     generator=None,
     stopwatch=None,
+    vae_encode_batch: int = 0,
 ):
     """Pack a batch of samples into one sequence and install the per-sample boundaries on the policy.
 
@@ -505,6 +506,10 @@ def pack_batch(
         generator (torch.Generator, optional): CPU generator. Defaults to None.
         stopwatch (Stopwatch, optional): Records the VAE encode as its own section, so the pack cost can be
             split into encode and layout. Pass the training loop's stopwatch. Defaults to None.
+        vae_encode_batch (int, optional): Samples per VAE encode call. Zero encodes the whole batch in one call.
+            A large rank batch (e.g. 32 samples at 480p) holds every sample's encoder activations at once and can
+            exhaust the card while packing; the official tokenizer encodes one item at a time, so a micro-batch of
+            4-8 is the closest fitting equivalent. Defaults to 0.
 
     Returns:
         tuple: ``(inputs, targets)``.
@@ -520,20 +525,35 @@ def pack_batch(
     else:
         if vae is None:
             raise ValueError("The batch carries no latent and no VAE was provided; supply one or the other.")
-        # The VAE can only run in the main process, since workers cannot touch the device. Encode the batch in one
-        # call and slice it per sample afterwards. The video follows the encoder's own dtype, so a half-precision VAE
-        # is not forced to spend the encode casting every activation back up to fp32.
+        # The VAE can only run in the main process, since workers cannot touch the device. The video follows the
+        # encoder's own dtype, so a half-precision VAE is not forced to spend the encode casting every activation
+        # back up to fp32. A large rank batch is encoded in micro-batches: holding every sample's encoder
+        # activations at once (32 samples at 480p is ~7.6 GiB in one intermediate) can exhaust the card, and the
+        # official tokenizer encodes one item at a time anyway.
         encode = stopwatch.section("vae") if stopwatch is not None else contextlib.nullcontext()
-        with torch.no_grad(), encode:
-            out = vae.encode(batch["video"].to(device, next(vae.parameters()).dtype))
+
+        def encode_video(video: torch.Tensor) -> torch.Tensor:
+            out = vae.encode(video.to(device, next(vae.parameters()).dtype))
             dist = getattr(out, "latent_dist", None)
             if dist is not None:
-                latent = dist.mode()
+                encoded = dist.mode()
             elif isinstance(out, (tuple, list)):
-                latent = out[0]
+                encoded = out[0]
             else:
-                latent = out
-            latent = latent.to(torch.bfloat16)
+                encoded = out
+            return encoded.to(torch.bfloat16)
+
+        with torch.no_grad(), encode:
+            video = batch["video"]
+            if vae_encode_batch and video.shape[0] > vae_encode_batch:
+                latent = torch.cat(
+                    [
+                        encode_video(video[start : start + vae_encode_batch])
+                        for start in range(0, video.shape[0], vae_encode_batch)
+                    ]
+                )
+            else:
+                latent = encode_video(video)
 
     per_sample = []
     for index in range(n):
