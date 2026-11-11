@@ -15,7 +15,7 @@ from examples.worldmodel.cosmos3_harness.heldout import (
     write_split_manifest,
 )
 from examples.worldmodel.cosmos3_harness.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
-from examples.worldmodel.cosmos3_harness.train import _build_optimizer
+from examples.worldmodel.cosmos3_harness.train import _build_optimizer, _check_heldout_manifest
 
 
 def _records():
@@ -221,3 +221,48 @@ def test_operator_bench_runs_on_cpu_and_records_its_conditions(tmp_path):
     assert set(report["results"]) == {"unscale_clip", "adamw"}
     assert set(report["results"]["unscale_clip"]) >= {"per_tensor_loop", "foreach_multi_tensor"}
     assert report["results"]["unscale_clip"]["foreach_multi_tensor"]["median_ms"] >= 0
+
+
+def _packs(sample_ids):
+    return [[{"sample_id": sample_id, "und_len": 4, "sequence_length": 12} for sample_id in sample_ids]]
+
+
+def _split_with_manifest(tmp_path):
+    records = [
+        {"sample_id": f"{group}-{index}", "trajectory_id": f"trajectory-{group}"}
+        for group in range(6)
+        for index in range(2)
+    ]
+    train_ids, validation_ids, manifest = split_by_group(records, validation_fraction=0.34, seed=0)
+    return train_ids, validation_ids, manifest, write_split_manifest(manifest, tmp_path / "heldout.json")
+
+
+def test_heldout_manifest_check_accepts_packs_that_follow_the_split(tmp_path):
+    train_ids, validation_ids, manifest, path = _split_with_manifest(tmp_path)
+
+    summary = _check_heldout_manifest(path, _packs(train_ids), _packs(validation_ids))
+
+    assert summary["training_samples"] == len(train_ids)
+    assert summary["eval_samples"] == len(validation_ids)
+    assert summary["fingerprint"] == split_fingerprint(manifest)
+
+
+def test_heldout_manifest_check_rejects_training_on_a_validation_sample(tmp_path):
+    train_ids, validation_ids, _, path = _split_with_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="assigns to validation"):
+        _check_heldout_manifest(path, _packs(train_ids + [validation_ids[0]]), _packs(validation_ids))
+
+
+def test_heldout_manifest_check_rejects_an_eval_sample_outside_the_split(tmp_path):
+    train_ids, validation_ids, _, path = _split_with_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="outside the manifest"):
+        _check_heldout_manifest(path, _packs(train_ids), _packs(validation_ids + ["someone-else-0"]))
+
+
+def test_heldout_manifest_check_requires_explicit_sample_ids(tmp_path):
+    train_ids, _, _, path = _split_with_manifest(tmp_path)
+
+    with pytest.raises(ValueError, match="carries no 'sample_id'"):
+        _check_heldout_manifest(path, _packs(train_ids) + [[{"und_len": 4, "sequence_length": 12}]], None)

@@ -39,6 +39,7 @@ from colossalai.shardformer.modeling.cosmos3 import clear_cosmos3_packed_meta, s
 from colossalai.shardformer.modeling.cosmos_mot import Cosmos3PackedBatch, pack_cosmos3_samples, two_way_varlen_summary
 
 try:
+    from examples.worldmodel.cosmos3_harness.heldout import load_split_manifest
     from examples.worldmodel.cosmos3_harness.loss import combine_modality_losses, normalise_packed_loss, velocity_mse
     from examples.worldmodel.cosmos3_harness.optim import build_adamw
     from examples.worldmodel.cosmos3_harness.training_metrics import (
@@ -49,6 +50,7 @@ try:
         device_memory_gib,
     )
 except ImportError:  # direct execution from the example directory
+    from heldout import load_split_manifest
     from loss import combine_modality_losses, normalise_packed_loss, velocity_mse
     from optim import build_adamw
     from training_metrics import AnomalyDetector, ConsoleObserver, TrainingMetrics, WandbObserver, device_memory_gib
@@ -59,7 +61,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model", help="Diffusers Cosmos 3 checkpoint directory or Hub id.")
     parser.add_argument("--replay-pack", help=".pt file with a list of packer-shaped sample dictionaries.")
     parser.add_argument("--eval-pack", help="Optional .pt file used as the fixed held-out pack.")
-    parser.add_argument("--heldout-manifest", help="JSON manifest produced by heldout.py; checked for overlap.")
+    parser.add_argument(
+        "--heldout-manifest",
+        help="JSON manifest written by heldout.py. Its fingerprint is verified, then the pack files are checked "
+        "against its sample lists: a training sample in the validation list, or an eval sample outside it, is an "
+        "error rather than a number quietly measured on a different split.",
+    )
     parser.add_argument("--backend", default="auto", choices=("auto", "naive", "npu", "cuda"))
     parser.add_argument("--precision", default="bf16", choices=("bf16", "fp16", "fp32"))
     parser.add_argument("--zero-stage", type=int, default=2, choices=(0, 1, 2))
@@ -257,6 +264,92 @@ def _load_replay_packs(path: str | Path) -> List[List[Dict]]:
     return payload
 
 
+def _pack_sample_ids(packs: Sequence[Sequence[Dict]], source: str) -> set:
+    """Collect the explicit sample ids of a pack file.
+
+    The packer falls back to a sample's position when ``sample_id`` is missing, and a position is not comparable
+    across pack files, so the held-out check requires the id to be written down.
+
+    Args:
+        packs: A pack file, as returned by :func:`_load_replay_packs`.
+        source (str): Name of the file, for the error message.
+
+    Returns:
+        set: The sample ids, as strings.
+
+    Raises:
+        ValueError: If a sample carries no ``sample_id``.
+    """
+    sample_ids = set()
+    for pack_index, pack in enumerate(packs):
+        for sample_index, sample in enumerate(pack):
+            if "sample_id" not in sample:
+                raise ValueError(
+                    f"{source}: pack {pack_index} sample {sample_index} carries no 'sample_id'. The held-out check "
+                    f"matches samples by id; add the id to the pack rather than relying on its position."
+                )
+            sample_ids.add(str(sample["sample_id"]))
+    return sample_ids
+
+
+def _check_heldout_manifest(
+    path: str | Path,
+    training_packs: Sequence[Sequence[Dict]],
+    eval_packs: Optional[Sequence[Sequence[Dict]]] = None,
+) -> Dict:
+    """Verify the split manifest and that the pack files stay on their side of it.
+
+    :func:`load_split_manifest` proves the sample lists were not edited after the split was drawn. It cannot see a
+    pack, so the two checks that need one live here: no training sample may be in ``validation_samples``, and every
+    eval sample must be in it. Together they also make the eval and training packs disjoint.
+
+    Args:
+        path: Manifest written by :func:`heldout.write_split_manifest`.
+        training_packs: Content of ``--replay-pack``.
+        eval_packs (Optional): Content of ``--eval-pack``, or None when there is no held-out pack.
+
+    Returns:
+        Dict: The counts and the fingerprint, for the run log.
+
+    Raises:
+        ValueError: On an edited manifest, a pack sample without an id, training on held-out samples, or an eval
+            sample the split never assigned to validation.
+    """
+    manifest = load_split_manifest(path)
+    train_split = set(manifest["train_samples"])
+    validation_split = set(manifest["validation_samples"])
+
+    training_ids = _pack_sample_ids(training_packs, "the replay pack")
+    leaked = sorted(training_ids & validation_split)
+    if leaked:
+        raise ValueError(
+            f"The replay pack holds {len(leaked)} sample(s) the manifest assigns to validation, starting with "
+            f"{leaked[:3]}. Training on them makes the held-out number a training number; rebuild the packs from "
+            f"this manifest instead of editing either side."
+        )
+
+    summary = {
+        "manifest": str(path),
+        "fingerprint": manifest.get("fingerprint"),
+        "train_split": len(train_split),
+        "validation_split": len(validation_split),
+        "training_samples": len(training_ids),
+        "eval_samples": 0,
+    }
+    if eval_packs is None:
+        return summary
+
+    eval_ids = _pack_sample_ids(eval_packs, "the eval pack")
+    outside = sorted(eval_ids - validation_split)
+    if outside:
+        raise ValueError(
+            f"The eval pack holds {len(outside)} sample(s) outside the manifest's validation list, starting with "
+            f"{outside[:3]}. The number would not be comparable with a run whose eval pack follows this manifest."
+        )
+    summary["eval_samples"] = len(eval_ids)
+    return summary
+
+
 def _to_device(batch: Cosmos3PackedBatch, device: torch.device) -> Cosmos3PackedBatch:
     moved = {
         name: value.to(device) if isinstance(value, torch.Tensor) else value
@@ -449,6 +542,12 @@ def train(args: argparse.Namespace) -> int:
     metrics = _build_metrics(args, rank, world_size, next(model.parameters()).device, backend)
 
     packs = _load_replay_packs(args.replay_pack)
+    eval_packs = _load_replay_packs(args.eval_pack) if args.eval_pack else None
+    if args.heldout_manifest:
+        heldout = _check_heldout_manifest(args.heldout_manifest, packs, eval_packs)
+        if rank == 0:
+            print(json.dumps({"heldout": heldout}), flush=True)
+
     start_step = 0
     epoch = 0
     sampler_cursor = 0  # absolute index of the next pack to read; advanced once per step
@@ -531,8 +630,7 @@ def train(args: argparse.Namespace) -> int:
 
     _save_state(Path(args.save_dir), model, optimizer, args.steps, epoch, sampler_cursor)
 
-    if args.eval_pack:
-        eval_packs = _load_replay_packs(args.eval_pack)
+    if eval_packs is not None:
         with torch.no_grad():
             losses = []
             for samples in eval_packs:
@@ -554,7 +652,7 @@ def train(args: argparse.Namespace) -> int:
                     "step_ms_mean": sum(timed) / len(timed) * 1e3,
                 }
             )
-        if args.eval_pack:
+        if eval_packs is not None:
             summary["heldout_losses"] = losses
         metrics.finish(summary)
 

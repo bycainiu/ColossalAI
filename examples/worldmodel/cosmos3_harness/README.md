@@ -60,9 +60,15 @@ torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
     --model /path/to/Cosmos3-Edge \
     --replay-pack /path/to/replay-packs.pt \
     --eval-pack /path/to/heldout-packs.pt \
+    --heldout-manifest /path/to/heldout.json \
     --backend cuda --zero-stage 2 --steps 100 \
     --save-dir /path/to/run
 ```
+
+`--heldout-manifest` verifies the manifest's fingerprint and then checks both pack files against its sample lists:
+a training sample the manifest assigns to validation, or an eval sample it never assigned there, is an error
+instead of a number quietly measured on a different split. Without an `--eval-pack` only the training side is
+checked.
 
 Resume with `--resume /path/to/run`. The same script runs on Ascend with `--backend npu`; the launch command is the
 site's HCCL launcher. A checkpoint saved on one topology is reloaded on the same topology for step-for-step
