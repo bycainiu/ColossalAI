@@ -451,7 +451,7 @@ def train(args: argparse.Namespace) -> int:
     packs = _load_replay_packs(args.replay_pack)
     start_step = 0
     epoch = 0
-    sampler_cursor = 0
+    sampler_cursor = 0  # absolute index of the next pack to read; advanced once per step
     if args.resume:
         state = _restore_state(Path(args.resume), model, optimizer)
         start_step = int(state["step"])
@@ -463,7 +463,8 @@ def train(args: argparse.Namespace) -> int:
     step_times: List[float] = []
     for step in range(start_step, args.steps):
         step_start = time.perf_counter()
-        samples = packs[(sampler_cursor + step) % len(packs)]
+        samples = packs[sampler_cursor % len(packs)]
+        sampler_cursor += 1
         batch = pack_cosmos3_samples(samples)
         optimizer.zero_grad(set_to_none=True)
         loss = _loss_for_batch(model, batch, samples, data_parallel_size)
@@ -516,7 +517,7 @@ def train(args: argparse.Namespace) -> int:
                 sections["mem"] = device_memory_gib()
             metrics.step(step + 1, **sections)
         if args.save_dir and (step + 1) % args.save_interval == 0:
-            _save_state(Path(args.save_dir), model, optimizer, step + 1, epoch, sampler_cursor + step + 1)
+            _save_state(Path(args.save_dir), model, optimizer, step + 1, epoch, sampler_cursor)
 
     if args.bench_json and rank == 0:
         _write_bench_report(
@@ -528,7 +529,7 @@ def train(args: argparse.Namespace) -> int:
             next(model.parameters()).device,
         )
 
-    _save_state(Path(args.save_dir), model, optimizer, args.steps, epoch, sampler_cursor + args.steps)
+    _save_state(Path(args.save_dir), model, optimizer, args.steps, epoch, sampler_cursor)
 
     if args.eval_pack:
         eval_packs = _load_replay_packs(args.eval_pack)
