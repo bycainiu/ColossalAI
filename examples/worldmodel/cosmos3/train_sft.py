@@ -136,6 +136,15 @@ def parse_args():
         "the whole data parallel group, i.e. plain ZeRO.",
     )
     parser.add_argument("--max-iter", type=int, default=10000)
+    parser.add_argument(
+        "--zero-stage",
+        type=int,
+        default=2,
+        choices=[0, 1, 2],
+        help="ZeRO stage inside the data-parallel group. The 8-rank recipe runs stage 2. At world size 1 there is no "
+        "data parallel group to shard, so stage 2 only adds all-gathers and reduce-scatters; use 0 for a single-rank "
+        "run.",
+    )
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument(
@@ -596,7 +605,7 @@ def main():
         sp_size=args.sp_size,
         enable_sequence_parallelism=args.sp_size > 1,
         sequence_parallelism_mode="all_to_all" if args.sp_size > 1 else None,
-        zero_stage=2,
+        zero_stage=args.zero_stage,
         precision="bf16",
         max_norm=GRAD_CLIP,
         custom_policy=policy,
