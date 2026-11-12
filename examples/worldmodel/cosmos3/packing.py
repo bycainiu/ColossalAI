@@ -85,18 +85,27 @@ def rectified_flow_noise(x0: torch.Tensor, t: torch.Tensor, generator=None):
     sense that ``x0 = x_t - sigma * target``, which is what tests/test_target_form.py checks: a flipped sign is
     still perfectly learnable on a single sample, so it has to be caught by the identity rather than by training.
 
+    Everything here is fp32, whatever dtype ``x0`` arrives in, because that is how upstream does it: it keeps
+    the clean payload in fp32 inside its ``PackedSequence`` and noises after packing, so its noise, its ``x_t``
+    and its target are all fp32. Drawing the noise in bf16 instead -- which is what ``dtype=x0.dtype`` used to
+    do, the payload coming out of a bf16 VAE -- quantizes the samples at about 0.4% relative, and the target
+    ``noise - x0`` inherits that. The target is what the gradient is taken against, so it is the one tensor
+    here worth keeping exact; the caller casts ``x_t`` to the model's dtype on its way into the forward and
+    leaves the target alone.
+
     Args:
-        x0 (torch.Tensor): Clean sample.
+        x0 (torch.Tensor): Clean sample, in any floating dtype.
         t (torch.Tensor): Noise level in [0, 1), broadcast against ``x0``.
         generator (torch.Generator, optional): CPU generator. Defaults to None.
 
     Returns:
-        tuple: ``(x_t, target)``, both shaped like ``x0``.
+        tuple: ``(x_t, target)``, both shaped like ``x0`` and both fp32.
     """
     # The generator lives on CPU, so the noise is drawn there and moved afterwards; this keeps a run reproducible
     # from a seed regardless of the device.
-    noise = torch.randn(x0.shape, generator=generator, dtype=x0.dtype).to(x0.device)
-    t = t.to(device=x0.device, dtype=x0.dtype)
+    noise = torch.randn(x0.shape, generator=generator, dtype=torch.float32).to(x0.device)
+    x0 = x0.float()
+    t = t.to(device=x0.device, dtype=torch.float32)
     while t.ndim < x0.ndim:
         t = t.unsqueeze(-1)
     return (1.0 - t) * x0 + t * noise, noise - x0
@@ -149,10 +158,42 @@ DROID_DOMAIN_ID = 8
 MROPE_BASE_FPS = 24.0  # edge_model_config.py::diffusion_expert_config.base_fps
 MROPE_TEMPORAL_MARGIN = 15000  # unified_3d_mrope_temporal_modality_margin
 VAE_TEMPORAL_COMPRESSION = 4
-ACTION_START_FRAME_OFFSET = 1
 
 
-def build_mrope_position_ids(n_text: int, vision_grid, n_act: int, fps: float) -> torch.Tensor:
+def action_start_frame_offset(*, has_initial_state: bool) -> int:
+    """Which vision frame ``action[0]`` is aligned to, in the mRoPE temporal axis.
+
+    Upstream derives this rather than fixing it (``transforms.py::build_sequence_plan``), and the derivation is a
+    case split on whether the action stream is as long as the video. With ``num_history_actions = 0``, which is
+    this recipe:
+
+    ===========================================  ======  =============================
+    condition                                    offset  meaning
+    ===========================================  ======  =============================
+    ``base_action_length == video_length - 1``        1  no initial-state row
+    ``base_action_length == video_length``            0  initial-state row present
+    ===========================================  ======  =============================
+
+    The ``+1`` exists only to skip past the action slot that an initial state would otherwise occupy
+    (``sequence.py`` documents the field as "align action[0] with vision frame action_start_frame_offset"). With
+    ``use_state=True`` the state *is* action row 0 and belongs at frame 0, next to the conditioning vision frame.
+
+    This module used to hardcode 1 while prepending the state row, which placed every action token one frame
+    (1/15 s) late. The upstream sample for episode 26827 carries ``sequence_plan.action_start_frame_offset = 0``,
+    which is where the value here comes from -- read off a real sample rather than off the default in a signature.
+
+    Args:
+        has_initial_state (bool): Whether the initial state has been prepended as action row 0.
+
+    Returns:
+        int: 0 with the state row, 1 without it.
+    """
+    return 0 if has_initial_state else 1
+
+
+def build_mrope_position_ids(
+    n_text: int, vision_grid, n_act: int, fps: float, *, action_frame_offset: int
+) -> torch.Tensor:
     """Build the ``[3, sequence_length]`` mRoPE position ids for one packed sample.
 
     The layout this matches is ``[text | vision | action]``, the order :func:`pack_one` appends them in.
@@ -162,6 +203,9 @@ def build_mrope_position_ids(n_text: int, vision_grid, n_act: int, fps: float) -
         vision_grid (tuple): ``(t_latent, hp, wp)``, the patchified latent grid.
         n_act (int): Number of action steps, the conditioning step included.
         fps (float): Frame rate of the source clip, 15 for this recipe.
+        action_frame_offset (int): The vision frame ``action[0]`` aligns to, from
+            :func:`action_start_frame_offset`. Deliberately has no default: the whole point of the helper is that
+            the value depends on the sample's layout, and a default here is what hid a one-frame shift before.
 
     Returns:
         torch.Tensor: ``[3, n_text + t*hp*wp + n_act]`` float positions, rows ``(temporal, height, width)``.
@@ -188,7 +232,7 @@ def build_mrope_position_ids(n_text: int, vision_grid, n_act: int, fps: float) -
 
     # Action: a (T, 1, 1) grid on the same temporal origin as the vision block, at frame rate (compression 1)
     # but normalized against the vision base, so both streams measure time in the same units.
-    action_t = (torch.arange(n_act, dtype=torch.float32) + ACTION_START_FRAME_OFFSET) / fps * base_tps + offset
+    action_t = (torch.arange(n_act, dtype=torch.float32) + action_frame_offset) / fps * base_tps + offset
     action = torch.stack([action_t, torch.zeros_like(action_t), torch.zeros_like(action_t)])
 
     return torch.cat([text, vision, action], dim=1)
@@ -235,6 +279,9 @@ def build_action_json_prompt(
     canvas_hw,
     aspect: str,
     viewpoint: str = "concat_view",
+    additional_view_description: str | None = None,
+    idle_frames: int | None = None,
+    total_action_frames: int | None = None,
 ) -> dict:
     """Build the prompt dictionary with the fields and the order ``ActionPromptJsonFormatter`` emits.
 
@@ -244,9 +291,17 @@ def build_action_json_prompt(
     Two formatting details that differ from each other on purpose: ``duration`` truncates to whole seconds while
     the end of the ``time`` range rounds, so 33 frames at 15 fps give ``"2s"`` and ``"0:00-0:02"``.
 
-    ``idle_frame`` is omitted. It needs idle-frame counts that come from the ``keep_ranges`` filter table, which the
-    recipe leaves off (``use_filter_dict=False``); upstream also drops the field when the count is missing, so the
-    result is the same prompt either way.
+    ``framing`` is two layers. :data:`VIEWPOINT_TEMPLATES` is the generic table every dataset shares, and each
+    dataset appends its own sentences through ``extras["additional_view_description"]``, which
+    ``ActionPromptJsonFormatter._get_viewpoint_caption`` joins on. The separator rule is upstream's: a single space
+    when the template already ends in a period, ``". "`` otherwise.
+
+    ``idle_frame`` is emitted whenever a count is supplied. An earlier revision of this docstring claimed the count
+    came from the ``keep_ranges`` filter table and was therefore unavailable with ``use_filter_dict=False``; both
+    halves were wrong. The count is computed from the raw action chunk by
+    ``pose_utils.compute_idle_frames`` (:func:`droid_dataset.count_idle_frames` here), the field is gated only on
+    ``mode != "inverse_dynamics"``, and upstream emits it for this recipe. ``keep_ranges`` drops whole windows from
+    the index; ``idle_frames`` counts still frames inside one window. The two share the word "idle" and nothing else.
 
     Args:
         task (str): The task annotation of this window.
@@ -255,20 +310,39 @@ def build_action_json_prompt(
         canvas_hw: ``(H, W)`` of the canvas **after** padding, not of the content region.
         aspect (str): Aspect key such as ``"4,3"``.
         viewpoint (str, optional): Key into :data:`VIEWPOINT_TEMPLATES`. Defaults to "concat_view".
+        additional_view_description (str, optional): The dataset's own view sentences, appended to the generic
+            template. Defaults to None.
+        idle_frames (int, optional): Idle frames in this window's action chunk. Omits the field when None.
+            Defaults to None.
+        total_action_frames (int, optional): Action rows the count is out of, for the ``"N out of M."`` form.
+            Upstream falls back to ``"N."`` without it. Defaults to None.
 
     Returns:
         dict: The prompt, with empty fields pruned.
     """
     duration = num_frames / float(fps)
     minutes, seconds = divmod(int(round(duration)), 60)
+    framing = VIEWPOINT_TEMPLATES.get(viewpoint)
+    if additional_view_description:
+        if framing is None:
+            framing = str(additional_view_description).rstrip()
+        else:
+            framing = framing + (" " if framing.endswith(".") else ". ") + str(additional_view_description).rstrip()
+    action_entry = {
+        "time": f"0:00-{minutes}:{seconds:02d}",
+        "description": _ensure_sentence(task),
+    }
+    if idle_frames is not None:
+        # Key order matters: upstream appends idle_frame after description, and json.dumps preserves insertion
+        # order all the way to the tokenizer.
+        action_entry["idle_frame"] = (
+            f"{int(idle_frames)} out of {int(total_action_frames)}."
+            if total_action_frames is not None
+            else f"{int(idle_frames)}."
+        )
     prompt = {
-        "cinematography": {"framing": VIEWPOINT_TEMPLATES.get(viewpoint)},
-        "actions": [
-            {
-                "time": f"0:00-{minutes}:{seconds:02d}",
-                "description": _ensure_sentence(task),
-            }
-        ],
+        "cinematography": {"framing": framing},
+        "actions": [action_entry],
         "duration": f"{int(duration)}s",
         "fps": float(fps),
         "resolution": {"H": int(canvas_hw[0]), "W": int(canvas_hw[1])},
@@ -303,7 +377,36 @@ def tokenize_prompt(prompt, tokenizer, *, cfg_dropout_rate=CFG_DROPOUT_RATE, gen
         add_generation_prompt=True,
         return_dict=False,
     )
-    return torch.tensor(ids[:MAX_TEXT_TOKENS], dtype=torch.long)
+    return torch.tensor(close_text_span(ids[:MAX_TEXT_TOKENS], tokenizer), dtype=torch.long)
+
+
+# The token that tells the model generation follows. Upstream calls it start_of_generation and takes it from
+# the tokenizer by name (sequence_packing/modality.py::add_special_tokens).
+START_OF_GENERATION = "<|vision_start|>"
+
+
+def close_text_span(ids: list[int], tokenizer) -> list[int]:
+    """Append the two markers upstream's text split ends with: EOS, then start-of-generation.
+
+    ``PackedSequenceBuilder.pack_text_tokens`` builds the span as
+
+        [BOS if the special-token dict has one] + caption_ids + [EOS] + [start_of_generation if media follows]
+
+    and this recipe always has media following. Upstream's dict comes from ``add_special_tokens``, which
+    defines ``start_of_generation`` / ``end_of_generation`` and no ``bos_token_id``, so no BOS is prepended;
+    measured, our 149 caption tokens are upstream's first 149 and the two it adds are these.
+
+    Leaving them off is not cosmetic. The BOV token is the boundary the model reads between the prompt and the
+    generated block, and without the pair every index after the text -- vision, action, loss, mRoPE positions --
+    sits two places early relative to upstream's.
+    """
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is None:
+        raise ValueError("the tokenizer defines no eos_token_id; upstream's text span always ends with EOS")
+    bov = tokenizer.convert_tokens_to_ids(START_OF_GENERATION)
+    if bov is None or bov == getattr(tokenizer, "unk_token_id", object()):
+        raise ValueError(f"the tokenizer does not know {START_OF_GENERATION}, which marks the generated block")
+    return list(ids) + [int(eos), int(bov)]
 
 
 def pack_one(
@@ -313,6 +416,7 @@ def pack_one(
     cfg,
     *,
     state: torch.Tensor = None,
+    payload_dtype: torch.dtype = torch.bfloat16,
     fps: float = 15.0,
     domain_id: int = DROID_DOMAIN_ID,
     resolution: str = "480",
@@ -368,7 +472,13 @@ def pack_one(
     to_device = lambda x: x.to(device)  # noqa: E731
     p = cfg.latent_patch_size
     _, _, t_latent, h, w = latent.shape
-    hp, wp = h // p, w // p
+    # Ceiling, not floor: an odd latent side is zero-padded up to the patch grid, never truncated. The forward
+    # does exactly that -- ``_patchify_and_pack_latents`` computes ``h_padded = ceil(h / p) * p``, zero-fills the
+    # new row, and derives its own ``h_patches`` from it -- and upstream's packed sequence reserves the same
+    # ceil-sized grid (token_shapes (9, 17, 20) for a 33x40 latent). Flooring would reserve 16 rows of sequence
+    # for the 17 the forward produces, and it only became reachable once the latent stopped being padded to the
+    # canvas: 544/16 = 34 is even, the 540-row content gives 33.
+    hp, wp = -(-h // p), -(-w // p)
     spatial = hp * wp
     n_vis = t_latent * spatial
 
@@ -393,19 +503,46 @@ def pack_one(
     # test_independent_modality_schedule_invalidates_fast_path, where the action timestep differs from the vision
     # one only when the flag is on. The forward multiplies the timestep by timestep_scale=0.001, so what is passed
     # here is sigma * 1000.
+    # The dtype x_t leaves in is the model's, not the payload's. Keeping the payload in fp32 all the way to
+    # here is what the reference implementation does -- measured on its own run, ``x0_tokens_vision`` and
+    # ``x0_tokens_action`` are float32 even when the model is bf16, and only ``xt_tokens_*`` is bf16 -- and it
+    # matters: rounding x0 before the interpolation throws away precision the interpolation would have kept,
+    # and no fp32 arithmetic downstream can recover it. Measured from one shared x0, with the payload left in
+    # fp32 our x_t and both targets come out bit-identical to upstream's.
+    latent_dtype = action_dtype = payload_dtype
     shift = RF_SHIFT[resolution]
     sigma = sample_sigma(shift, "waver", generator)
     t_vis_raw = t_act_raw = sigma * 1000.0
+    # fp32 for sigma too, not the payload dtype: bf16 cannot hold a sampled sigma. The pinned 0.5 used in the
+    # upstream comparison is exact in bf16, which is why a comparison at that sigma would not have shown it.
     latent_noisy, target_vis = rectified_flow_noise(
-        latent, torch.tensor(t_vis_raw / 1000.0, dtype=latent.dtype), generator
+        latent, torch.tensor(t_vis_raw / 1000.0, dtype=torch.float32), generator
     )
     action_noisy, target_act = rectified_flow_noise(
-        action, torch.tensor(t_act_raw / 1000.0, dtype=action.dtype), generator
+        action, torch.tensor(t_act_raw / 1000.0, dtype=torch.float32), generator
     )
     # Restore the conditioning frames. rectified_flow_noise returns fresh tensors, so writing in place here does
-    # not touch latent or action.
+    # not touch latent or action. Those tensors are fp32 now and the clean rows come from the payload's own
+    # dtype, so the assignment widens them, which is exact.
     latent_noisy[:, :, :n_cond_vis] = latent[:, :, :n_cond_vis]
     action_noisy[:n_cond_act] = action[:n_cond_act]
+    # And clear the padding channels the noise just filled. Upstream noises the full padded width and then
+    # throws that part away (omni_mot_model.py::_add_noise_to_input):
+    #
+    #     for i in range(len(xt_action)):
+    #         if gen_data_clean.raw_action_dim is not None and gen_data_clean.raw_action_dim[i] is not None:
+    #             xt_action[i][:, gen_data_clean.raw_action_dim[i] :] = 0
+    #
+    # Those channels are not a formality. ``action_proj_in`` is a 64 -> 4096 projection, so noise sitting in
+    # the 56 padded channels is projected into the hidden state like any other input: measured on episode
+    # 26827 offset 0 at a pinned sigma of 0.5, our action rows entering block 0 carried 52% more norm than
+    # upstream's (165.8 against 108.8, relL2 1.15), while the conditioning row -- which is never noised --
+    # matched bit for bit, and the vision rows, which have no padding, agreed to 3.3%. With the padding
+    # cleared, our x_t matches upstream's to relL2 1.6e-03, the bf16 floor.
+    #
+    # Only x_t is cleared, which is what upstream clears. The target keeps its padding, and it never reaches
+    # the loss: compute_loss crops both sides to raw_action_dim.
+    action_noisy[:, raw_action_dim:] = 0
 
     vis_idx = to_device(torch.arange(n_text, n_text + n_vis))
     act_idx = to_device(torch.arange(n_text + n_vis, seq))
@@ -415,20 +552,36 @@ def pack_one(
     inputs = dict(
         input_ids=to_device(input_ids),
         text_indexes=to_device(torch.arange(n_text)),
-        position_ids=to_device(build_mrope_position_ids(n_text, (t_latent, hp, wp), n_act, fps)),
+        position_ids=to_device(
+            build_mrope_position_ids(
+                n_text,
+                (t_latent, hp, wp),
+                n_act,
+                fps,
+                # n_cond_act is 1 exactly when the state row was prepended, which is upstream's
+                # has_initial_state.
+                action_frame_offset=action_start_frame_offset(has_initial_state=bool(n_cond_act)),
+            )
+        ),
         und_len=n_text,
         sequence_length=seq,
-        vision_tokens=[to_device(latent_noisy)],
+        # x_t goes in at the model's dtype -- the payload's, which is the VAE's -- while the target above stays
+        # fp32. Upstream does the same: it noises in fp32 and the forward casts on the way in.
+        vision_tokens=[to_device(latent_noisy.to(latent_dtype))],
         vision_token_shapes=[(t_latent, hp, wp)],
         vision_sequence_indexes=vis_idx,
         vision_mse_loss_indexes=vis_idx[n_cond_vis * spatial :],
-        vision_timesteps=to_device(torch.full((n_vis_noisy,), t_vis_raw, dtype=latent.dtype)),
+        # fp32, not the payload dtype. The forward computes ``time_proj(timesteps * timestep_scale)`` and only
+        # casts afterwards, and upstream carries these in fp32; in bf16 a sampled timestep of 734.21 is
+        # stored as 734.0, which shifts the embedding of every noisy token. The pinned sigma 0.5 -> 500.0 is
+        # exact in bf16, so a comparison at that sigma would not have shown it.
+        vision_timesteps=to_device(torch.full((n_vis_noisy,), t_vis_raw, dtype=torch.float32)),
         vision_noisy_frame_indexes=[to_device(torch.arange(n_cond_vis, t_latent))],
-        action_tokens=[to_device(action_noisy)],
+        action_tokens=[to_device(action_noisy.to(action_dtype))],
         action_token_shapes=[(n_act, 1, 1)],
         action_sequence_indexes=act_idx,
         action_mse_loss_indexes=act_idx[n_cond_act:],
-        action_timesteps=to_device(torch.full((n_act_noisy,), t_act_raw, dtype=action.dtype)),
+        action_timesteps=to_device(torch.full((n_act_noisy,), t_act_raw, dtype=torch.float32)),
         action_noisy_frame_indexes=[to_device(torch.arange(n_cond_act, n_act))],
         action_domain_ids=[to_device(torch.tensor(domain_id))],
     )
@@ -459,6 +612,58 @@ def _as_device(device):
     return device
 
 
+def normalize_latent(latent: torch.Tensor, vae) -> torch.Tensor:
+    """Scale a raw VAE latent by the Wan 2.2 channel statistics, the way the upstream encode does.
+
+    Upstream never hands out a raw latent: ``WanVAE.__init__`` builds ``self.scale = (mean, 1.0 / std)`` from 48
+    hardcoded Wan 2.2 channel statistics, and ``Wan2pt2VAEInterface.encode`` calls
+    ``self.model.encode(videos, self.scale)``, so the tensor the transformer sees is already whitened per
+    channel. diffusers keeps the same statistics on the config as ``latents_mean`` / ``latents_std`` but does not
+    apply them inside ``encode`` -- that is left to the caller, and we were not doing it.
+
+    Measured on one real DROID window against the upstream encode, same pixels, same GPU:
+
+        raw latent                    relL2 5.1652e-01   std 0.683105
+        (x - mean) * (1 / std)        relL2 5.8847e-03   std 1.017034
+        upstream                                  --     std 1.017380
+
+    The 48 channel constants are identical on both sides: diffusers' ``latents_mean`` / ``latents_std`` match
+    upstream's hardcoded lists element for element, all 48 of each. So the only thing this function has to get
+    right is the formula, and the residual 5.9e-03 is the bf16 encode rather than the scaling.
+
+    So the model was being fed latents off by a per-channel affine map, a relative error of 0.52 -- 84% of the
+    augmentation spread, and two orders of magnitude worse than anything else measured in this example. The
+    residual 5.9e-03 after scaling is the bf16 encode itself (4.8e-03 on 910B, 6.4e-03 on H20), so this closes
+    the gap down to the precision floor.
+
+    The statistics are read off the VAE config rather than hardcoded, so they stay tied to the checkpoint.
+
+    Args:
+        latent (torch.Tensor): ``[B, C, T, H, W]`` raw latent straight out of ``vae.encode``.
+        vae: The VAE, read for ``config.latents_mean`` and ``config.latents_std``.
+
+    Returns:
+        torch.Tensor: The normalized latent, in the dtype of ``latent``.
+    """
+    cfg = getattr(vae, "config", None)
+    mean = getattr(cfg, "latents_mean", None)
+    std = getattr(cfg, "latents_std", None)
+    if mean is None or std is None:
+        raise ValueError(
+            "The VAE config carries no latents_mean/latents_std, so the latent cannot be scaled the way "
+            "upstream scales it. Encoding without them leaves the latent off by a per-channel affine map."
+        )
+    shape = (1, -1) + (1,) * (latent.ndim - 2)
+    m = torch.as_tensor(mean, device=latent.device, dtype=torch.float32).view(shape)
+    # Reciprocal first, then multiply, because that is literally what upstream does: ``WanVAE.__init__`` builds
+    # ``self.scale = (mean, 1.0 / std)`` and multiplies by it ever after. The choice is not numerically load
+    # bearing -- measured on a latent of the real shape, ``(x - m) / s`` and ``(x - m) * (1 / s)`` differ by
+    # relL2 4.17e-08, max 4.8e-07, on 24% of elements, which is one float32 ulp. It is written this way so the
+    # correspondence to upstream's formula needs no argument, not because it moves any number.
+    inv_std = 1.0 / torch.as_tensor(std, device=latent.device, dtype=torch.float32).view(shape)
+    return ((latent.float() - m) * inv_std).to(latent.dtype)
+
+
 def pack_batch(
     batch,
     vae,
@@ -471,6 +676,7 @@ def pack_batch(
     resolution: str = "480",
     device="npu:0",
     generator=None,
+    payload_dtype: torch.dtype = torch.bfloat16,
     stopwatch=None,
     vae_encode_batch: int = 0,
 ):
@@ -494,8 +700,8 @@ def pack_batch(
     one call that cannot be half-performed.
 
     Args:
-        batch: A collated batch, either with ``video`` or with a precomputed ``latent``.
-        vae: The VAE, or None when the batch carries latents.
+        batch: A collated batch carrying ``video``.
+        vae: The VAE. Required: the latent is encoded here.
         tokenizer: Tokenizer for the prompt.
         cfg: The model config.
         policy: The Cosmos3 policy, or anything exposing ``set_packed_meta``.
@@ -504,74 +710,106 @@ def pack_batch(
         resolution (str, optional): Key into :data:`RF_SHIFT`. Defaults to "480".
         device: Device for the packed tensors.
         generator (torch.Generator, optional): CPU generator. Defaults to None.
-        stopwatch (Stopwatch, optional): Records the VAE encode as its own section, so the pack cost can be
-            split into encode and layout. Pass the training loop's stopwatch. Defaults to None.
-        vae_encode_batch (int, optional): Samples per VAE encode call. Zero encodes the whole batch in one call.
-            A large rank batch (e.g. 32 samples at 480p) holds every sample's encoder activations at once and can
-            exhaust the card while packing; the official tokenizer encodes one item at a time, so a micro-batch of
-            4-8 is the closest fitting equivalent. Defaults to 0.
+        stopwatch: Optional section timer; records the online encode separately.
+        vae_encode_batch (int): Samples per encode call, or zero for the whole batch.
 
     Returns:
         tuple: ``(inputs, targets)``.
 
     Raises:
-        ValueError: If the batch has neither latents nor a usable VAE.
+        ValueError: If no VAE was given.
     """
     device = _as_device(device)
-    n = batch["latent"].shape[0] if "latent" in batch else batch["video"].shape[0]
+    n = batch["video"].shape[0]
 
-    if "latent" in batch:
-        latent = batch["latent"].to(device=device, dtype=torch.bfloat16)
-    else:
-        if vae is None:
-            raise ValueError("The batch carries no latent and no VAE was provided; supply one or the other.")
-        # The VAE can only run in the main process, since workers cannot touch the device. The video follows the
-        # encoder's own dtype, so a half-precision VAE is not forced to spend the encode casting every activation
-        # back up to fp32. A large rank batch is encoded in micro-batches: holding every sample's encoder
-        # activations at once (32 samples at 480p is ~7.6 GiB in one intermediate) can exhaust the card, and the
-        # official tokenizer encodes one item at a time anyway.
-        encode = stopwatch.section("vae") if stopwatch is not None else contextlib.nullcontext()
+    if vae is None:
+        raise ValueError("pack_batch encodes the video here and needs a VAE; there is no precomputed-latent path.")
 
-        def encode_video(video: torch.Tensor) -> torch.Tensor:
-            out = vae.encode(video.to(device, next(vae.parameters()).dtype))
-            dist = getattr(out, "latent_dist", None)
-            if dist is not None:
-                encoded = dist.mode()
-            elif isinstance(out, (tuple, list)):
-                encoded = out[0]
-            else:
-                encoded = out
-            return encoded.to(torch.bfloat16)
+    # The latent is always encoded here, never read from disk, and there is no way to hand one in. That removes
+    # the only route by which a latent could reach the model without passing through normalize_latent, which is
+    # worth more than the convenience: a cache written before that function existed holds latents off by a
+    # per-channel affine map, relL2 0.52 against upstream, and training on them raises nothing and diverges from
+    # nothing. A path that cannot be made safe is better absent than documented.
+    #
+    # Caching would be the wrong trade here anyway. Augmentation runs before the VAE, so a cache freezes it: six
+    # augmented draws of one window sit 0.614 apart in relL2, further than two adjacent distinct windows (0.522),
+    # so the cache would remove more variation than the dataset's own stride-1 sampling provides. And the recipe
+    # runs 10000 iterations at a global batch of 8192 -- 4.86 passes over 16.3M windows -- so a lossless cache
+    # would have to store every visit: 81.9M x 1.29 MiB = 100 TiB in bf16. Upstream's answer to the cost is to
+    # make the online encode cheap instead: AOT-compiled chunk kernels, channels_last_3d weights, bf16.
+    #
+    # The VAE can only run in the main process, since workers cannot touch the device. Encode the batch in one
+    # call and slice it per sample afterwards. The input follows the VAE's own dtype rather than a fixed one,
+    # so that --vae-dtype actually changes what the convolutions compute instead of being upcast right here.
+    if vae_encode_batch < 0:
+        raise ValueError("vae_encode_batch must be nonnegative")
+    if n < 1:
+        raise ValueError("Cannot pack an empty video batch")
+    vae_dtype = next(vae.parameters()).dtype
+    encode = stopwatch.section("vae") if stopwatch is not None else contextlib.nullcontext()
 
-        with torch.no_grad(), encode:
-            video = batch["video"]
-            if vae_encode_batch and video.shape[0] > vae_encode_batch:
-                latent = torch.cat(
-                    [
-                        encode_video(video[start : start + vae_encode_batch])
-                        for start in range(0, video.shape[0], vae_encode_batch)
-                    ]
-                )
-            else:
-                latent = encode_video(video)
+    def encode_video(video):
+        out = vae.encode(video.to(device, vae_dtype))
+        dist = getattr(out, "latent_dist", None)
+        if dist is not None:
+            return dist.mode()
+        return out[0] if isinstance(out, (tuple, list)) else out
+
+    with torch.no_grad(), encode:
+        video = batch["video"]
+        size = vae_encode_batch or n
+        latent = torch.cat([encode_video(video[start : start + size]) for start in range(0, n, size)])
+        # Micro-batching changes only encode calls. Normalization and its cast point match the baseline;
+        # the clean payload remains FP32 until pack_one casts x_t at the model entrance.
+        latent = normalize_latent(latent, vae).float()
+
+    # The canvas is padded; the latent must not be. ``resize_and_reflect_pad`` fits the composite inside the
+    # bucket canvas and reflection-pads the bottom and right edges, so for DROID a 540x640 composite sits in a
+    # 544x736 frame. Upstream encodes the padded frame and then throws the padding away in latent space
+    # (omni_mot_model.py::_remove_padding_from_latent, called on the encode's output): floor-divide the content
+    # size by the spatial compression factor and keep that top-left corner, at least one row and column.
+    #
+    # Skipping this is not a rounding difference. It leaves 34x46 latent cells where upstream has 33x40, so the
+    # vision stream carries 3519 tokens instead of 3060, the sequence length and every index after it move, and
+    # 13% of the loss is computed on reflected pixels. Measured on episode 26827 offset 0.
+    #
+    # The factor is read off the two shapes rather than named as a constant, so a VAE whose compression differs
+    # from the recipe's 16 cannot silently crop to the wrong place.
+    spatial_factor = batch["video"].shape[-2] // latent.shape[-2]
+    if latent.shape[-1] * spatial_factor != batch["video"].shape[-1]:
+        raise ValueError(
+            f"The VAE does not compress the two spatial axes equally: video {tuple(batch['video'].shape[-2:])} "
+            f"-> latent {tuple(latent.shape[-2:])}; the padding cannot be mapped into latent space."
+        )
 
     per_sample = []
     for index in range(n):
+        # Action rows the prompt describes: the chunk plus the state row pack_one prepends.
+        n_action_frames = int(batch["action"][index].shape[0]) + (1 if "state" in batch else 0)
+        view_desc = batch.get("additional_view_description")
+        idle = batch.get("idle_frames")
         prompt = build_action_json_prompt(
             batch["task"][index],
             num_frames=num_frames,
             fps=fps,
             canvas_hw=batch["canvas_hw"][index].tolist(),
             aspect=batch["aspect_key"][index],
+            additional_view_description=view_desc[index] if view_desc is not None else None,
+            idle_frames=int(idle[index]) if idle is not None else None,
+            total_action_frames=n_action_frames,
         )
         ids = tokenize_prompt(prompt, tokenizer, generator=generator)
+        content_h, content_w = (int(v) for v in batch["content_hw"][index].tolist())
+        keep_h = max(content_h // spatial_factor, 1)
+        keep_w = max(content_w // spatial_factor, 1)
         per_sample.append(
             pack_one(
-                latent[index : index + 1],
-                batch["action"][index].to(torch.bfloat16),
+                latent[index : index + 1, :, :, :keep_h, :keep_w].contiguous(),
+                batch["action"][index].float(),
                 ids,
                 cfg,
-                state=batch["state"][index].to(torch.bfloat16) if "state" in batch else None,
+                state=batch["state"][index].float() if "state" in batch else None,
+                payload_dtype=payload_dtype,
                 fps=fps,
                 device=device,
                 resolution=str(resolution),
@@ -695,6 +933,10 @@ def compute_loss(out, targets, return_components: bool = False):
             "The model returned no vision or action predictions; check that the forward received non-empty "
             "vision and action inputs."
         )
+
+    for modality, predictions in (("vision", out.sample), ("action", out.action)):
+        if not (len(predictions) == len(targets[modality]) == len(targets[f"{modality}_noisy_mask"])):
+            raise ValueError(f"{modality} predictions, targets and masks must have the same sample count")
 
     vision = torch.stack(
         [

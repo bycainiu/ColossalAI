@@ -18,13 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from droid_dataset import (
-    DroidActionPolicyDataset,
-    episode_starts,
-    filtered_starts,
-    keep_ranges_key,
-    resolve_shards,
-)
+from droid_dataset import DroidActionPolicyDataset, episode_starts, filtered_starts, keep_ranges_key, resolve_shards
 
 CAM_FEATURES = (
     "observation.image.wrist_image_left",
@@ -115,6 +109,20 @@ def test_a_range_shorter_than_a_window_keeps_nothing():
 
 def test_a_range_is_clamped_to_the_episode():
     assert filtered_starts([[0, 10_000]], length=36, chunk_length=32) == [0, 1, 2, 3]
+
+
+def test_filtered_stride_uses_frame_coordinates_and_range_origin():
+    assert filtered_starts([[20, 60]], length=100, chunk_length=32, stride=2) == [20, 22, 24, 26]
+    assert filtered_starts([[21, 60]], length=100, chunk_length=32, stride=3) == [21, 24, 27]
+    assert filtered_starts([[-20, 999]], length=39, chunk_length=32, stride=3) == [0, 3, 6]
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_window_helpers_reject_nonpositive_stride(stride):
+    with pytest.raises(ValueError, match="stride"):
+        episode_starts(100, 32, stride)
+    with pytest.raises(ValueError, match="stride"):
+        filtered_starts([[20, 60]], 100, 32, stride)
 
 
 def test_repeated_ranges_are_not_deduped():
