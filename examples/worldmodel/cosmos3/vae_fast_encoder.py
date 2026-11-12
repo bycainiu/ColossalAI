@@ -12,8 +12,9 @@
    input in place, so the shortcut can be computed first and the clone dropped: on the widest block that is a
    128 MB copy per call, four blocks per encoder call.
 
-Both are arithmetically exact -- the tests assert bit equality against diffusers' own forward -- so they carry no
-accuracy cost at all, unlike the fused RMSNorm which rounds ``scale / norm`` once before multiplying.
+These transformations preserve the convolution arithmetic. Different backend
+algorithms may still round differently, so validate the target dtype/device and
+checkpoint rather than assuming bit equality or an end-to-end accuracy bound.
 """
 
 from __future__ import annotations
@@ -33,8 +34,9 @@ def _fast_conv_forward(self, x, cache_x=None):
         cache_x = cache_x.to(x.device)
         x = torch.cat([cache_x, x], dim=2)
         pad_t -= cache_x.shape[2]
-    if pad_t > 0:
-        # Causal: frames in front, none behind. H/W are the convolution's own job.
+    if pad_t != 0:
+        # Negative padding crops an oversized cache, as diffusers' F.pad does.
+        # Causal: frames in front, none behind. H/W are the convolution's job.
         x = F.pad(x, (0, 0, 0, 0, pad_t, 0))
     return F.conv3d(
         x,
@@ -47,7 +49,9 @@ def _fast_conv_forward(self, x, cache_x=None):
     )
 
 
-def _fast_down_forward(self, x, feat_cache=None, feat_idx=[0]):
+def _fast_down_forward(self, x, feat_cache=None, feat_idx=None):
+    if feat_idx is None:
+        feat_idx = [0]
     shortcut = self.avg_shortcut(x)
     for resnet in self.resnets:
         x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)

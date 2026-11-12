@@ -7,10 +7,10 @@ encodes a configurable number of *pixel* frames per call while carrying the caus
 (technical report Sec. 5.2.6: 68 frames at 256p, 24 at 480p, 12 at 720p; the released code's default is
 ``{"256": 68, "480": 24, "720": 8}``).
 
-The result is the same latent up to floating point: the per-call caches are what make the chunking an
-implementation detail, so a wider window only changes how much work each kernel launch gets. The chunk size has
-to be a multiple of 4 -- the tokenizer's temporal compression -- so that the stride-2 temporal downsamples keep
-their phase, which is also what the official code asserts.
+Causal caches preserve the temporal schedule across windows. Backend accumulation
+and compiler choices can still change numerical results; validate the checkpoint,
+dtype and device used by an experimental recipe. The chunk size must be a
+multiple of 4 so stride-2 temporal downsamples keep their phase.
 
     from vae_chunked import enable_chunked_encode
 
@@ -26,13 +26,23 @@ OFFICIAL_CHUNK_FRAMES = {"256": 68, "480": 24, "720": 8}
 
 
 def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int, chunk_runner=None) -> torch.Tensor:
+    """Encode one independent clip, clearing causal state even on errors/tiling."""
+    vae.clear_cache()
+    try:
+        return _encode_chunked_impl(vae, x, chunk_frames, chunk_runner)
+    finally:
+        vae.clear_cache()
+
+
+def _encode_chunked_impl(vae, x: torch.Tensor, chunk_frames: int, chunk_runner=None) -> torch.Tensor:
     """``AutoencoderKLWan._encode`` with a configurable encoder-call window."""
-    if chunk_frames % 4:
-        raise ValueError(f"chunk_frames must be a multiple of 4, got {chunk_frames}")
+    if not isinstance(chunk_frames, int) or chunk_frames <= 0 or chunk_frames % 4:
+        raise ValueError(f"chunk_frames must be a positive multiple of 4, got {chunk_frames}")
+    if x.ndim != 5 or x.shape[2] < 1:
+        raise ValueError("expected a nonempty [B, C, T, H, W] clip")
     _, _, num_frame, height, width = x.shape
     num_latent = (num_frame - 1) // 4 + 1
 
-    vae.clear_cache()
     if vae.config.patch_size is not None:
         from diffusers.models.autoencoders.autoencoder_kl_wan import patchify
 
@@ -65,12 +75,20 @@ def _encode_chunked(vae, x: torch.Tensor, chunk_frames: int, chunk_runner=None) 
 
     out = torch.cat(parts, 2) if len(parts) > 1 else parts[0]
     out = out[:, :, :num_latent]
-    enc = vae.quant_conv(out)
-    vae.clear_cache()
-    return enc
+    return vae.quant_conv(out)
 
 
-def enable_chunked_encode(vae, chunk_frames: int, aot_dir=None, verbose: bool = False):
+def enable_chunked_encode(
+    vae,
+    chunk_frames: int,
+    aot_dir=None,
+    verbose: bool = False,
+    *,
+    gate_rtol=1e-3,
+    gate_atol=None,
+    gate_relative_l2=None,
+    version_identity=None,
+):
     """Install the wider encoder call window on ``vae``. Returns the VAE so this can wrap a constructor.
 
     Args:
@@ -80,15 +98,31 @@ def enable_chunked_encode(vae, chunk_frames: int, aot_dir=None, verbose: bool = 
             directory and dispatch to the compiled graph, falling back to eager per variant. Defaults to None,
             i.e. eager chunks.
         verbose (bool, optional): Print AOT compile/gate lines. Defaults to False.
+        gate_rtol, gate_atol, gate_relative_l2: See ``AOTChunkRunner`` for relative,
+            absolute and relative-L2 gate budgets. Only used when AOT is enabled.
+        version_identity: Optional checkpoint/code identity passed to the runner.
     """
-    if chunk_frames <= 0:
+    if chunk_frames == 0 and aot_dir is None:
         return vae
+    if not isinstance(chunk_frames, int) or chunk_frames <= 0 or chunk_frames % 4:
+        raise ValueError("chunk_frames must be a positive multiple of 4 when chunking/AOT is enabled")
 
     runner = None
     if aot_dir is not None:
-        from vae_aot import AOTChunkRunner
+        if __package__:
+            from .vae_aot import AOTChunkRunner
+        else:
+            from vae_aot import AOTChunkRunner
 
-        runner = AOTChunkRunner(vae.encoder, save_dir=aot_dir, verbose=verbose)
+        runner = AOTChunkRunner(
+            vae.encoder,
+            save_dir=aot_dir,
+            verbose=verbose,
+            gate_rtol=gate_rtol,
+            gate_atol=gate_atol,
+            gate_relative_l2=gate_relative_l2,
+            version_identity=version_identity,
+        )
 
     def _encode(x):
         return _encode_chunked(vae, x, chunk_frames, runner)
