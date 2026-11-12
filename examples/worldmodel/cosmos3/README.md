@@ -4,7 +4,7 @@ This example follows `action_policy_droid_nano` with the diffusers Cosmos 3 mode
 
 ## Alignment reference
 
-The integration uses the numerical/data contracts at official `npu/dev` commit `94d0e6323c332bde6670fe01be60bd8cc0c9fd97`, including [6516](https://github.com/hpcaitech/ColossalAI/pull/6516), [6518](https://github.com/hpcaitech/ColossalAI/pull/6518), [6522](https://github.com/hpcaitech/ColossalAI/pull/6522) and [6525](https://github.com/hpcaitech/ColossalAI/pull/6525). FP32 timestep/sinusoidal arithmetic and action-head initialization follow [6519](https://github.com/hpcaitech/ColossalAI/pull/6519) at `7ca82f0d48feced03a55369db81d152552281cf0` (still open when checked on 2026-11-12). These functions were composed with the local CP, selective checkpointing and VAE facilities rather than merging an entire branch.
+The integration uses the numerical/data contracts merged into official `npu/dev` at `7c8bd8af36ef5f095c855193ae77c2366c5865f5` (2026-11-12): [6516](https://github.com/hpcaitech/ColossalAI/pull/6516), [6518](https://github.com/hpcaitech/ColossalAI/pull/6518), [6519](https://github.com/hpcaitech/ColossalAI/pull/6519), [6522](https://github.com/hpcaitech/ColossalAI/pull/6522), [6525](https://github.com/hpcaitech/ColossalAI/pull/6525) and the follow-up [6526](https://github.com/hpcaitech/ColossalAI/pull/6526). This branch syncs that state and keeps the local CP, HSDP, selective checkpointing, VAE and replay extensions on top; where the two implement the same contract, the official data/precision semantics are unchanged. The synced reference recipe is under [upstream](upstream/README.md).
 
 The default contract is:
 
