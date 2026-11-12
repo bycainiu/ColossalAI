@@ -98,6 +98,8 @@ class Cosmos3OmniTransformer(torch.nn.Module):
 
     def __init__(self, num_layers: int = 2) -> None:
         super().__init__()
+        self.time_embedder = torch.nn.Identity()
+        self.time_proj = torch.nn.Identity()
         self.config = SimpleNamespace(
             num_attention_heads=NUM_HEADS,
             num_key_value_heads=NUM_KV_HEADS,
@@ -167,8 +169,18 @@ def _reference_pathways(attn, und_seq, gen_seq, rotary_emb, ar_lens, dm_lens):
                 )
             )
         if dm_len > 0:
-            keys = torch.cat((k_und_for_gen[ar_offset : ar_offset + ar_len], k_gen[dm_offset : dm_offset + dm_len]))
-            values = torch.cat((v_und[ar_offset : ar_offset + ar_len], v_gen[dm_offset : dm_offset + dm_len]))
+            keys = torch.cat(
+                (
+                    k_und_for_gen[ar_offset : ar_offset + ar_len],
+                    k_gen[dm_offset : dm_offset + dm_len],
+                )
+            )
+            values = torch.cat(
+                (
+                    v_und[ar_offset : ar_offset + ar_len],
+                    v_gen[dm_offset : dm_offset + dm_len],
+                )
+            )
             dm_outputs.append(_sdpa(q_gen[dm_offset : dm_offset + dm_len], keys, values, causal=False))
         ar_offset += ar_len
         dm_offset += dm_len
@@ -635,7 +647,13 @@ def test_single_sample_pack_uses_three_axis_mrope_positions():
     expected_column_positions = torch.arange(w_patches).repeat(h_patches * frames)
     torch.testing.assert_close(
         vision_positions,
-        torch.stack((expected_frame_positions, expected_row_positions, expected_column_positions)),
+        torch.stack(
+            (
+                expected_frame_positions,
+                expected_row_positions,
+                expected_column_positions,
+            )
+        ),
     )
 
     action_positions = pack["position_ids"][:, pack["action_sequence_indexes"]]
@@ -643,7 +661,13 @@ def test_single_sample_pack_uses_three_axis_mrope_positions():
     expected_action_spatial_positions = torch.zeros(n_act, dtype=torch.long)
     torch.testing.assert_close(
         action_positions,
-        torch.stack((expected_action_times, expected_action_spatial_positions, expected_action_spatial_positions)),
+        torch.stack(
+            (
+                expected_action_times,
+                expected_action_spatial_positions,
+                expected_action_spatial_positions,
+            )
+        ),
     )
 
 
@@ -709,7 +733,9 @@ def _merge_single_sample_packs(packs):
 
 
 @pytest.mark.parametrize("use_und_k_norm_for_gen", [False, True])
-def test_real_model_gives_the_same_result_with_the_policy_processor(use_und_k_norm_for_gen):
+def test_real_model_gives_the_same_result_with_the_policy_processor(
+    use_und_k_norm_for_gen,
+):
     device = _test_device()
     model = _tiny_cosmos3(use_und_k_norm_for_gen).to(device)
     pack = _to_device(_single_sample_pack(n_text=3, frames=2, seed=1), device)
@@ -803,13 +829,22 @@ def test_activation_checkpointing_recomputes_with_the_same_pack_metadata():
     reference_model = _CheckpointedCosmos3OmniTransformer(num_layers=2).double()
     reference_model.gradient_checkpointing = False
     checkpointed_model = copy.deepcopy(reference_model)
+    checkpointed_model.gradient_checkpointing = True
     meta = TwoWayPackedMeta([4, 3], [2, 5])
     set_cosmos3_packed_meta(reference_model, meta, strict=True)
     set_cosmos3_packed_meta(checkpointed_model, meta, strict=True)
 
     und_seq, gen_seq, rotary_emb = _inputs([4, 3], [2, 5], seed=40)
-    reference_inputs = [und_seq.clone().requires_grad_(True), gen_seq.clone().requires_grad_(True), rotary_emb]
-    checkpointed_inputs = [und_seq.clone().requires_grad_(True), gen_seq.clone().requires_grad_(True), rotary_emb]
+    reference_inputs = [
+        und_seq.clone().requires_grad_(True),
+        gen_seq.clone().requires_grad_(True),
+        rotary_emb,
+    ]
+    checkpointed_inputs = [
+        und_seq.clone().requires_grad_(True),
+        gen_seq.clone().requires_grad_(True),
+        rotary_emb,
+    ]
 
     reference_und, reference_gen = reference_model(*reference_inputs)
     (reference_und.square().sum() + reference_gen.square().sum()).backward()
@@ -826,7 +861,11 @@ def test_activation_checkpointing_recomputes_with_the_same_pack_metadata():
         torch.testing.assert_close(actual.grad, reference.grad, rtol=1e-10, atol=1e-12)
 
 
-def test_processor_accepts_the_cuda_backend_label():
+def test_processor_accepts_the_cuda_backend_label(monkeypatch):
+    monkeypatch.setattr(
+        "colossalai.shardformer.modeling.cosmos3._load_cuda_varlen_attention",
+        lambda: None,
+    )
     processor = ColossalTwoWayAttnProcessor(backend="cuda")
     assert processor.backend == "cuda"
 

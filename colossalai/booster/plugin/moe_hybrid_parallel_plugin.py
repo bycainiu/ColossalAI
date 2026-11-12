@@ -171,6 +171,8 @@ class MoeHybridParallelPlugin(HybridParallelPlugin):
         enable_metadata_cache (bool, optional): Whether to enable metadata cache for pipeline parallelism. Defaults to True.
         make_vocab_size_divisible_by (int, optional): it's used when padding the vocabulary size, to make it choose an faster kenel. Default to 64.
         overlap_p2p (bool, optional): Whether to overlap the p2p communication in pipeline parallelism.
+        cast_inputs (bool, optional): Cast floating forward arguments to the mixed-precision dtype. Defaults to True.
+        cast_buffers (bool, optional): Cast floating buffers along with parameters. Defaults to True.
         use_fp8 (bool, optional): Whether to enable fp8 mixed precision training. Defaults to False.
         fp8_communication (bool, optional): Whether to enable fp8 communication. Defaults to False.
     """
@@ -223,6 +225,8 @@ class MoeHybridParallelPlugin(HybridParallelPlugin):
         overlap_allgather: bool = False,
         fp8_communication: bool = False,
         use_fp8: bool = False,
+        cast_inputs: bool = True,
+        cast_buffers: bool = True,
     ) -> None:
         self.logger = get_dist_logger()
         if overlap_communication or zero_stage == 2:
@@ -362,6 +366,8 @@ class MoeHybridParallelPlugin(HybridParallelPlugin):
             self.mixed_dp_group = self.dp_group
             self.mixed_moe_dp_group = self.moe_dp_group
 
+        self.cast_inputs = cast_inputs
+        self.cast_buffers = cast_buffers
         self.use_fp8 = use_fp8
 
         self.shard_config = ShardConfig(
@@ -468,6 +474,8 @@ class MoeHybridParallelPlugin(HybridParallelPlugin):
                 use_ddp=use_ddp,
                 ddp_config=self.ddp_config,
                 custom_policy=self.custom_policy,
+                cast_inputs=self.cast_inputs,
+                cast_buffers=self.cast_buffers,
                 use_fp8=self.use_fp8,
             )
         if optimizer is not None and not isinstance(optimizer, OptimizerWrapper):

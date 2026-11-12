@@ -85,8 +85,13 @@ class Cosmos3OmniTransformer(torch.nn.Module):
             hidden_size=HIDDEN,
         )
         self.layers = torch.nn.ModuleList([Cosmos3PackedMoTAttention(seed=index) for index in range(num_layers)])
+        # Exercise the production policy's timestep pair through the real Booster, too.
+        self.time_proj = torch.nn.Identity()
+        self.time_embedder = torch.nn.Linear(HIDDEN, HIDDEN)
 
     def forward(self, und_seq, gen_seq, rotary_emb):
+        features = self.time_proj(torch.ones_like(gen_seq[:1]))
+        gen_seq = gen_seq + self.time_embedder(features)
         if self._cp_shard_fn is not None:
             und_seq, gen_seq, rotary_emb = self._cp_shard_fn(und_seq, gen_seq, rotary_emb)
         for layer in self.layers:

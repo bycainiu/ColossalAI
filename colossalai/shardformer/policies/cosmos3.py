@@ -21,6 +21,8 @@ from ..modeling.cosmos3 import (
     ColossalTwoWayAttnProcessor,
     enable_cosmos3_context_parallel,
     enable_cosmos3_selective_checkpointing,
+    install_fp32_sinusoidal_timestep_input,
+    install_fp32_timestep_embedding,
 )
 from .base_policy import ModulePolicyDescription, Policy, SubModuleReplacementDescription
 
@@ -49,10 +51,15 @@ class Cosmos3OmniPolicy(Policy):
             share a processor with code that already holds one, e.g. a script that pre-sets pack metadata.
         selective_checkpointing (bool, optional): Recompute only the MLP half of each decoder layer and keep the
             attention half live, instead of the whole-layer recompute of ``enable_gradient_checkpointing``. Defaults to
-            ``False``. Do not also set the model's ``gradient_checkpointing`` flag: the two nest.
+            ``False``. Full ``gradient_checkpointing`` and selective checkpointing are mutually exclusive.
         selective_budget_gib (float, optional): Memory budget for the selective checkpointing. Small packs keep the
             MLP-only path; large packs switch to the official-style SAC path, which checkpoints the whole layer and
-            keeps the attention op outputs of only as many layers as fit. Defaults to 8.0 GiB.
+            keeps attention op outputs for an estimated number of layers. This is a heuristic, not a hard
+            memory cap, and is re-estimated when pack shapes/dtypes change. Defaults to 8.0 GiB.
+        fp32_timestep_embedding (bool, optional): Compute the timestep MLP in fp32 with parameters kept in the
+            training dtype. Defaults to True.
+        fp32_sinusoidal_input (bool, optional): Restore unrounded sinusoidal inputs before the fp32 timestep MLP.
+            Applies when fp32_timestep_embedding is enabled. Defaults to True.
 
     Raises:
         ValueError: If ``backend`` is not a known two-way kernel backend.
@@ -64,8 +71,12 @@ class Cosmos3OmniPolicy(Policy):
         processor: Optional[ColossalTwoWayAttnProcessor] = None,
         selective_checkpointing: bool = False,
         selective_budget_gib: float = 8.0,
+        fp32_timestep_embedding: bool = True,
+        fp32_sinusoidal_input: bool = True,
     ) -> None:
         super().__init__()
+        self.fp32_timestep_embedding = fp32_timestep_embedding
+        self.fp32_sinusoidal_input = fp32_sinusoidal_input
         self.selective_checkpointing = selective_checkpointing
         self.selective_budget_gib = selective_budget_gib
         self.processor = processor if processor is not None else ColossalTwoWayAttnProcessor(backend=backend)
@@ -122,7 +133,11 @@ class Cosmos3OmniPolicy(Policy):
                 )
         unsupported = [
             flag
-            for flag in ("enable_fused_normalization", "enable_flash_attention", "enable_jit_fused")
+            for flag in (
+                "enable_fused_normalization",
+                "enable_flash_attention",
+                "enable_jit_fused",
+            )
             if getattr(self.shard_config, flag, False)
         ]
         if unsupported:
@@ -229,6 +244,7 @@ class Cosmos3OmniPolicy(Policy):
                 scale=getattr(self.processor, "scale", None),
                 dropout_p=getattr(self.processor, "dropout_p", 0.0),
             )
+            self.context_parallel = context_parallel
             self.processor = context_parallel.processor
         installed = 0
         for module in self.model.modules():
@@ -241,6 +257,32 @@ class Cosmos3OmniPolicy(Policy):
                 f"Cosmos3OmniPolicy found no {_ATTENTION_CLS} module in {type(self.model).__name__}. The policy only "
                 "applies to a Cosmos 3 omni transformer; check the model passed to the booster."
             )
+        if self.fp32_timestep_embedding:
+            # Here rather than in the plugin, and a forward rather than a dtype, because of the order: the
+            # plugin casts the module after this pass runs, so a dtype set here would not survive. A forward
+            # replacement does, and it reads the parameters at call time.
+            wrapped = install_fp32_timestep_embedding(self.model)
+            if wrapped == 0 and not any(
+                getattr(module, "_colossal_fp32_forward", False) for module in self.model.modules()
+            ):
+                raise RuntimeError(
+                    "fp32_timestep_embedding is on but the model has no time_embedder module, so the timestep "
+                    "arithmetic would silently run in the training dtype. Pass fp32_timestep_embedding=False "
+                    "if that is intended."
+                )
+            # Second, and after the first so that it wraps it: the model rounds the sinusoidal projection to
+            # the embedder's parameter dtype before the call, and the reference implementation does not round
+            # there at all. Running the embedder in fp32 on an input that arrived rounded recovers only half
+            # of the difference.
+            paired = install_fp32_sinusoidal_timestep_input(self.model) if self.fp32_sinusoidal_input else 1
+            if paired == 0 and not any(
+                getattr(module, "_colossal_fp32_sinusoid_installed", False) for module in self.model.modules()
+            ):
+                raise RuntimeError(
+                    "fp32_timestep_embedding is on but no module owns both a time_proj and a time_embedder, "
+                    "so the sinusoidal features would still be rounded to the training dtype before the "
+                    "embedder sees them. Pass fp32_timestep_embedding=False if that is intended."
+                )
         if self.selective_checkpointing:
             # Here rather than before the boost so the patch lands on the layers as they come out of the shard pass.
             enable_cosmos3_selective_checkpointing(self.model, budget_gib=self.selective_budget_gib)
