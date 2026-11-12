@@ -9,14 +9,15 @@ Design contract, in order of importance:
 
 1. **The JSONL file is the source of truth.** Weights & Biases and TensorBoard are optional adapters that consume
    the same flattened record. A cluster without network access still gets a complete, inspectable history.
-2. **No new synchronization in the hot path.** Every value in a record is either a host-side number or a scalar the
-   caller already read. Section timings use accelerator events recorded lazily and read after a sync the training
-   loop already performs (``loss.item()`` at the log step), so enabling metrics does not empty the device queue.
+2. **Synchronization belongs to the caller.** Every value in a record is either a host-side number or a scalar the
+   caller already read. Section timings use accelerator events recorded lazily; the caller synchronizes measured
+   optimizer windows before reading them. Host dispatch timings and fallback sources are reported separately.
 3. **The per-step path is a buffered append.** Files are line-buffered and never ``fsync``-ed; a crash loses at
    most the last few records, not the run.
-4. **Aggregation is explicit about reduction.** Token counts sum, step times take the maximum (the straggler),
-   losses take the mean -- which is exact for a token-normalised loss: each rank's value is
-   ``local_sum * dp / global_tokens``, so the plain mean over ranks is ``sum_all / tokens_all``.
+4. **Aggregation is explicit about reduction.** Counts sum, with callers excluding CP copies; step times take
+   the maximum (the straggler). Losses take the rank mean. Callers must normalize to their declared objective:
+   ``local_sum * dp / global_count`` yields a global mean over samples for DROID or supervised elements for the
+   generic replay objective. Equal-sized SFT packs already have equal sample weight; CP copies repeat that loss.
 
 Typical use::
 
@@ -86,11 +87,13 @@ REDUCTIONS: Dict[str, str] = {
     "perf/forward_ms": "max",
     "perf/backward_ms": "max",
     "perf/optim_ms": "max",
+    "perf/host_dispatch_ms": "max",
+    "perf/step_dispatch_ms": "max",
     "mem/allocated_gib": "max",
     "mem/peak_gib": "max",
     "ckpt/save_ms": "max",
     "ckpt/async_pending": "max",
-    # The mean over ranks is the global token mean; see the module docstring.
+    # Callers normalize losses for their declared sample/element objective; see the module docstring.
     "loss/total": "mean",
     "loss/vision": "mean",
     "loss/action": "mean",
@@ -329,11 +332,13 @@ class Stopwatch:
     def __init__(self, use_events: Optional[bool] = None) -> None:
         self._use_events = _events_available() if use_events is None else bool(use_events)
         self._enabled = False
-        self._spans: Dict[str, Tuple[float, float, Any, Any]] = {}
+        self._spans: Dict[str, List[Tuple[float, float, Any, Any]]] = {}
+        self.timing_sources: Dict[str, str] = {}
 
     def reset(self, enabled: bool = True) -> None:
         """Start a new step; only an enabled step records anything."""
         self._spans.clear()
+        self.timing_sources.clear()
         self._enabled = bool(enabled)
 
     def _record_event(self):
@@ -365,25 +370,35 @@ class Stopwatch:
         finally:
             end = time.perf_counter()
             end_event = self._record_event()
-            self._spans[name] = (start, end, start_event, end_event)
+            self._spans.setdefault(name, []).append((start, end, start_event, end_event))
 
     def read_ms(self) -> Dict[str, float]:
         """Return ``{section: milliseconds}``.
 
         Call this only after a point where the device has been synchronized for another reason (``loss.item()`` at
-        the log step). If an event pair is unavailable or not yet complete, the wall-clock value is used instead and
-        the section is therefore an upper bound of dispatch time rather than device time.
+        the log step). Repeated sections are summed across the accumulation window. An unavailable event pair
+        falls back to host dispatch time; ``timing_sources`` labels that fallback explicitly.
         """
         timings: Dict[str, float] = {}
-        for name, (start, end, start_event, end_event) in self._spans.items():
-            value = None
-            if start_event is not None and end_event is not None:
-                try:
-                    value = float(start_event.elapsed_time(end_event))
-                except Exception:
-                    value = None
-            timings[name] = value if value is not None else (end - start) * 1e3
+        for name, spans in self._spans.items():
+            total = 0.0
+            sources = set()
+            for start, end, start_event, end_event in spans:
+                value = None
+                if start_event is not None and end_event is not None:
+                    try:
+                        value = float(start_event.elapsed_time(end_event))
+                    except Exception:
+                        value = None
+                sources.add("device_events" if value is not None else "host_dispatch")
+                total += value if value is not None else (end - start) * 1e3
+            timings[name] = total
+            self.timing_sources[name] = next(iter(sources)) if len(sources) == 1 else "mixed"
         return timings
+
+    def read_dispatch_ms(self) -> Dict[str, float]:
+        """Return summed host dispatch durations, separately from device event durations."""
+        return {name: sum((end - start) * 1e3 for start, end, _, _ in spans) for name, spans in self._spans.items()}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -520,8 +535,10 @@ class ConsoleObserver(MetricsObserver):
     def on_event(self, event):
         values = event.get("values") or {}
         suffix = f" {values}" if values else ""
-        self._print(f"[event step {event.get('step', '?')}] {event.get('severity', 'warn')} "
-                    f"{event.get('kind', 'event')}: {event.get('message', '')}{suffix}")
+        self._print(
+            f"[event step {event.get('step', '?')}] {event.get('severity', 'warn')} "
+            f"{event.get('kind', 'event')}: {event.get('message', '')}{suffix}"
+        )
 
 
 class WandbObserver(MetricsObserver):
@@ -787,8 +804,13 @@ class AnomalyDetector:
         if loss is not None:
             if not math.isfinite(loss):
                 events.append(
-                    make_event(step, "nonfinite_loss", f"loss is {loss}; the step should be skipped", "error",
-                               rank=int(record.get("rank", 0)))
+                    make_event(
+                        step,
+                        "nonfinite_loss",
+                        f"loss is {loss}; the step should be skipped",
+                        "error",
+                        rank=int(record.get("rank", 0)),
+                    )
                 )
                 self._loss_ema = None
             else:
@@ -979,7 +1001,9 @@ class TrainingMetrics:
             return
 
         records, events = [dict(record)], [
-            event for pending_step in sorted(self._pending_events) if pending_step <= int(step)
+            event
+            for pending_step in sorted(self._pending_events)
+            if pending_step <= int(step)
             for event in self._pending_events.pop(pending_step)
         ]
         if self._aggregator is not None:

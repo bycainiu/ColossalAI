@@ -158,7 +158,7 @@ def test_adamw_auto_arms_take_the_same_step_from_the_same_gradients():
     plain_model = copy.deepcopy(base)
     npu_model = copy.deepcopy(base)
     plain = _build_optimizer(plain_model, 1e-3, backend="naive")
-    foreach = _build_optimizer(npu_model, 1e-3, backend="npu")
+    foreach = _build_optimizer(npu_model, 1e-3, backend="naive", device_type="npu")
 
     assert plain.defaults["foreach"] in (None, False), "off NPU the builder must not force the foreach path"
     assert foreach.defaults["foreach"] is True
@@ -173,13 +173,19 @@ def test_adamw_auto_arms_take_the_same_step_from_the_same_gradients():
         torch.testing.assert_close(actual, expected, rtol=0, atol=1e-8)
 
 
-def test_adamw_fused_mode_falls_back_when_torch_npu_is_absent(monkeypatch):
-    # ``None`` in sys.modules makes the import raise even on a host that has torch_npu installed for CPU use.
+def test_adamw_fused_mode_rejects_unsupported_devices_and_missing_torch_npu(monkeypatch):
+    # An explicit optimizer choice cannot silently change the implementation.
     monkeypatch.setitem(sys.modules, "torch_npu", None)
-    optimizer = _build_optimizer(torch.nn.Linear(2, 2), 1e-5, backend="naive", mode="fused")
+    with pytest.raises(ValueError, match="requires an NPU"):
+        _build_optimizer(torch.nn.Linear(2, 2), 1e-5, backend="npu", mode="fused")
+    with pytest.raises(ValueError, match="requires torch_npu"):
+        _build_optimizer(torch.nn.Linear(2, 2), 1e-5, backend="auto", device_type="npu", mode="fused")
 
-    assert type(optimizer) is torch.optim.AdamW
-    assert optimizer.defaults["foreach"] is True
+
+def test_adamw_attention_backend_does_not_select_the_optimizer_device():
+    for backend in ("npu", "cuda", "naive"):
+        optimizer = _build_optimizer(torch.nn.Linear(2, 2), 1e-5, backend=backend)
+        assert optimizer.defaults["foreach"] in (None, False)
 
 
 def test_adamw_builder_rejects_an_unknown_mode():

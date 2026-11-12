@@ -158,17 +158,26 @@ class DroidWamPolicy:
     def from_pretrained(
         cls, checkpoint: Path, *, transformer_path: Path | None, config: dict, device: str, backend: str
     ):
+        if device.startswith("npu"):
+            importlib.import_module("torch_npu")
+        resolved = torch.device(device)
+        from examples.worldmodel.cosmos3.runtime import resolve_attention_backend
+
+        backend = resolve_attention_backend(backend, resolved.type)
+        if resolved.type not in ("cpu", "cuda", "npu"):
+            raise ValueError("Policy inference supports CPU, CUDA or NPU devices")
+
         from cosmos_framework.data.generator.action.utils.transforms import ActionTransformPipeline
         from cosmos_framework.model.generator.diffusion.samplers.fm_solvers_unipc import FlowUniPCMultistepScheduler
         from diffusers import AutoencoderKLWan, Cosmos3OmniTransformer
         from transformers import AutoTokenizer
 
-        from colossalai.shardformer.modeling.cosmos3 import ColossalTwoWayAttnProcessor
+        from colossalai.shardformer.modeling.cosmos3 import (
+            ColossalTwoWayAttnProcessor,
+            install_fp32_sinusoidal_timestep_input,
+            install_fp32_timestep_embedding,
+        )
 
-        if device.startswith("npu"):
-            importlib.import_module("torch_npu")
-
-        resolved = torch.device(device)
         if resolved.type == "npu":
             torch.npu.set_device(resolved)
             torch.npu.conv.allow_hf32 = False
@@ -177,8 +186,6 @@ class DroidWamPolicy:
             torch.cuda.set_device(resolved)
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
-        if (backend == "npu" and resolved.type != "npu") or (backend == "cuda" and resolved.type != "cuda"):
-            raise ValueError("Attention backend must match the policy device")
         transformer = (
             Cosmos3OmniTransformer.from_pretrained(
                 str(transformer_path or checkpoint / "transformer"), torch_dtype=torch.bfloat16, local_files_only=True
@@ -187,6 +194,8 @@ class DroidWamPolicy:
             .requires_grad_(False)
             .to(resolved)
         )
+        install_fp32_timestep_embedding(transformer)
+        install_fp32_sinusoidal_timestep_input(transformer)
         if not transformer.config.action_gen or transformer.config.action_dim < config["action_dim"]:
             raise ValueError("Checkpoint must enable the DROID action generation head")
         if not transformer.config.enable_fps_modulation or not transformer.config.unified_3d_mrope_reset_spatial_ids:

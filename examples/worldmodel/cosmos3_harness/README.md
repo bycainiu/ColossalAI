@@ -8,14 +8,14 @@ reduction, the training loop and the evaluation/benchmark manifests.
 ## What is supported
 
 - One packed batch containing several samples, laid out as a global AR block followed by a global DM block.
-- BF16, data parallel + ZeRO (`tp=pp=sp=1`). The policy rejects pipeline and sequence parallelism.
-- `--backend naive` as the portable reference, `--backend cuda` for PyTorch's native packed `varlen_attn` kernel, and
-  `--backend npu` for the Ascend two-call kernel.
-- Synchronous model/optimizer checkpoints plus a separate `training_state.pt` for step, sampler cursor and RNG.
+- BF16, data parallel + ZeRO, with optional `--cp-size N` Ulysses context parallelism (`tp=pp=1`).
+- `--attn-backend` (alias `--backend`) chooses attention; `--device` independently selects the accelerator.
+  `auto` detects the device and uses its communication backend (NCCL/HCCL).
+- Immutable model/optimizer checkpoint generations, one public training state and one RNG file per rank.
+- Explicit `--loss-objective droid` or `generic-vision-token-mean`, and explicit `--replay-mode replicated|sharded`.
 - A grouped held-out split that never puts two windows of the same trajectory on both sides.
 
-TP/PP/SP, Super/Nano variants and the full audio/action generation recipe are outside this scope. Do not claim them
-from a passing smoke run.
+TP/PP, Super/Nano variants and audio generation are outside this entry point's scope.
 
 ## Quick checks that need no accelerator or checkpoint
 
@@ -52,8 +52,12 @@ the fingerprint check fail instead of silently comparing different splits.
 
 `--replay-pack` is a `.pt` file holding a list of packs; each pack is a list of sample dictionaries shaped like the
 packer output (`und_len`, `sequence_length`, `input_ids`, `text_indexes`, `position_ids`, the vision/action/sound
-fields, and `vision_target` for this harness). The production recipe can compute `vision_target` from its own noise and
-timestep sampling; the framework contract does not change.
+fields). `--loss-objective generic-vision-token-mean` requires `vision_target` per sample and rejects action/sound
+inputs. This legacy generic objective averages vision elements; it is not the DROID training objective.
+`--loss-objective droid` instead requires a complete per-sample `targets` mapping from `cosmos3.packing.pack_one`
+(`vision`, `action`, `raw_action_dim`, `vision_noisy_mask`, `action_noisy_mask`) and delegates to that recipe's
+`compute_loss`. Masks retain full targets and denominators, channels are masked by raw action width, and samples
+receive equal weight across the whole DP accumulation window.
 
 ```bash
 torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
@@ -61,7 +65,8 @@ torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
     --replay-pack /path/to/replay-packs.pt \
     --eval-pack /path/to/heldout-packs.pt \
     --heldout-manifest /path/to/heldout.json \
-    --backend cuda --zero-stage 2 --steps 100 \
+    --device cuda --attn-backend cuda --zero-stage 2 --steps 100 \
+    --replay-mode replicated --loss-objective generic-vision-token-mean \
     --save-dir /path/to/run
 ```
 
@@ -70,9 +75,19 @@ a training sample the manifest assigns to validation, or an eval sample it never
 instead of a number quietly measured on a different split. Without an `--eval-pack` only the training side is
 checked.
 
-Resume with `--resume /path/to/run`. The same script runs on Ascend with `--backend npu`; the launch command is the
-site's HCCL launcher. A checkpoint saved on one topology is reloaded on the same topology for step-for-step
-equivalence; a different world size reloads model/optimizer shards but is reported as a topology change.
+With `--replay-mode replicated`, every rank reads the same replay file; DP peers stride over distinct packs while
+CP peers share the same DP coordinate and pack. At least one pack per DP rank is required. With `sharded`, use
+`--replay-pack '/path/shard-{dp_rank}.pt'`: each DP rank reads a distinct file, shared by its CP peers. File hashes
+are checked across the topology before training. `--gradient-accumulation-steps N` accumulates every microstep;
+the cursor counts consumed global pack slots in replicated mode and consumed local slots in sharded mode.
+`--checkpoint-mode none|full|selective` also accepts the alias `--activation-checkpointing`.
+
+Resume with `--resume /path/to/run` or an individual `checkpoint-*` generation. `latest.json` is atomically replaced
+only after model/optimizer shards, the public `training_state.pt`, and every rank's Python/NumPy/Torch/accelerator
+RNG file are written and covered by a SHA256 completion manifest. Incomplete or corrupted generations are rejected
+before loading weights. Resume requires matching world size, CP topology, objective, optimizer configuration,
+accumulation and replay fingerprints. Old unverified checkpoint layouts are rejected. The same command runs on
+Ascend with `--device npu --attn-backend npu`; communication is selected from the accelerator.
 
 ## Kernel and benchmark evidence
 
@@ -97,7 +112,8 @@ python examples/worldmodel/cosmos3_harness/bench_ops.py --op all --device npu \
     --num-tensors 432 --numel 400000 --output logs/cosmos3-ops.json
 torchrun --nproc_per_node=8 examples/worldmodel/cosmos3_harness/train.py \
     --model /path/to/Cosmos3-Edge --replay-pack /path/to/bench-packs.pt --save-dir /tmp/bench \
-    --backend npu --precision bf16 --zero-stage 2 --steps 40 --bench-warmup 10 \
+    --device npu --attn-backend npu --precision bf16 --zero-stage 2 --steps 40 --bench-warmup 10 \
+    --replay-mode replicated --loss-objective generic-vision-token-mean \
     --bench-json logs/cosmos3-step.json
 ```
 

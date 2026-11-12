@@ -1,13 +1,13 @@
 r"""Minimal ColossalAI training entry point for Cosmos 3.
 
 The script is deliberately small: it owns the distributed launch, the plugin/policy wiring, metadata lifetime,
-token-normalised loss reduction, checkpoint state and held-out evaluation. The data recipe (how a sample's latents,
+explicit sample/element loss objectives, checkpoint state and held-out evaluation. The data recipe (how a sample's latents,
 targets, timesteps and loss masks are produced) stays outside; a replay pack is a ``.pt`` file holding a list of
 packer-shaped sample dictionaries, exactly the input of
 :func:`colossalai.shardformer.modeling.cosmos_mot.pack_cosmos3_samples`.
 
-Only the ``BF16 + DP/ZeRO + tp=pp=sp=1`` path is in scope. Tensor, pipeline and sequence parallelism are not
-validated for Cosmos 3, and the policy rejects PP/SP.
+The real training path supports BF16 + DP/ZeRO and optional Ulysses context parallelism.
+Tensor and pipeline parallelism are outside this entry point.
 
 This is the harness half of the Cosmos 3 examples. The DROID action-policy SFT recipe lives next door in
 ``examples/worldmodel/cosmos3`` and owns the data pipeline (LeRobot decoding, the VAE, the prompt and the noise
@@ -22,18 +22,23 @@ Launch a real run on two H20 GPUs:
 
     torchrun --nproc_per_node=2 examples/worldmodel/cosmos3_harness/train.py \
         --model /path/to/Cosmos3-Edge --replay-pack /path/to/replay-packs.pt \
-        --backend cuda --zero-stage 2 --steps 100 --save-dir /path/to/run
+        --device cuda --attn-backend cuda --replay-mode replicated \
+        --loss-objective generic-vision-token-mean --zero-stage 2 --steps 100 --save-dir /path/to/run
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import torch
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from colossalai.shardformer.modeling.cosmos3 import clear_cosmos3_packed_meta, set_cosmos3_packed_meta
 from colossalai.shardformer.modeling.cosmos_mot import Cosmos3PackedBatch, pack_cosmos3_samples, two_way_varlen_summary
@@ -67,7 +72,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "against its sample lists: a training sample in the validation list, or an eval sample outside it, is an "
         "error rather than a number quietly measured on a different split.",
     )
-    parser.add_argument("--backend", default="auto", choices=("auto", "naive", "npu", "cuda"))
+    parser.add_argument("--backend", "--attn-backend", default="auto", choices=("auto", "naive", "npu", "cuda"))
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "npu"), default="auto")
+    parser.add_argument(
+        "--replay-mode",
+        choices=("replicated", "sharded"),
+        required=False,
+        help="replicated: one shared pack file, DP-strided; sharded: per-DP files, supports {dp_rank}.",
+    )
+    parser.add_argument(
+        "--loss-objective",
+        choices=("droid", "generic-vision-token-mean"),
+        help="Required for real training; DROID replay samples carry complete 'targets' mappings.",
+    )
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--cp-size", type=int, default=1)
+    parser.add_argument(
+        "--checkpoint-mode", "--activation-checkpointing", choices=("none", "full", "selective"), default="full"
+    )
     parser.add_argument("--precision", default="bf16", choices=("bf16", "fp16", "fp32"))
     parser.add_argument("--zero-stage", type=int, default=2, choices=(0, 1, 2))
     parser.add_argument("--steps", type=int, default=100)
@@ -104,25 +126,30 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--wandb-run-name", help="W&B run name; defaults to W&B's generated name.")
     parser.add_argument("--dry-run", action="store_true", help="Exercise packing and loss on CPU; no model or GPU.")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    for name in ("gradient_accumulation_steps", "cp_size", "save_interval", "log_interval", "metrics_every"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.steps < 0:
+        parser.error("--steps must be nonnegative")
+    return args
 
 
 def resolve_backend(requested: str) -> str:
     """Resolve ``auto`` from the accelerator without hiding the choice in the policy default."""
-    if requested != "auto":
-        return requested
     from colossalai.accelerator import get_accelerator
+    from examples.worldmodel.cosmos3.runtime import resolve_attention_backend
 
-    name = get_accelerator().name
-    return {"npu": "npu", "cuda": "cuda"}.get(name, "naive")
+    return resolve_attention_backend(requested, get_accelerator().name)
 
 
 def _build_optimizer(
     model,
     learning_rate: float,
-    backend: str,
+    backend: str = "auto",
     mode: str = "auto",
     *,
+    device_type: Optional[str] = None,
     betas: Sequence[float] = (0.9, 0.999),
     eps: float = 1e-8,
     weight_decay: float = 0.01,
@@ -133,6 +160,7 @@ def _build_optimizer(
         learning_rate,
         backend,
         mode,
+        device_type=device_type,
         betas=betas,
         eps=eps,
         weight_decay=weight_decay,
@@ -152,7 +180,7 @@ def _device_capacity_gib(device: torch.device) -> Optional[float]:
     """Total HBM of one device, for the memory-pressure check; None when the build cannot report it."""
     try:
         if device.type == "npu":
-            import torch_npu  # noqa: F401
+            pass
 
             return torch.npu.get_device_properties(device).total_memory / 2**30
         if device.type == "cuda":
@@ -174,7 +202,7 @@ def _run_manifest(args: argparse.Namespace, device: torch.device, backend: str, 
         "env": collect_env(device),
         "backend": backend,
         "world_size": world_size,
-        "topology": {"tp": 1, "pp": 1, "sp": 1, "zero_stage": args.zero_stage},
+        "topology": {"tp": 1, "pp": 1, "cp": args.cp_size, "zero_stage": args.zero_stage},
         "model": args.model,
         "replay_pack": args.replay_pack,
         "eval_pack": args.eval_pack,
@@ -259,9 +287,12 @@ def _load_replay_packs(path: str | Path) -> List[List[Dict]]:
     payload = torch.load(Path(path), map_location="cpu", weights_only=True)
     if not isinstance(payload, list) or not payload:
         raise ValueError(f"{path} must hold a non-empty list of packs (each pack is a list of sample dictionaries).")
-    if isinstance(payload[0], dict):
-        return [payload]
-    return payload
+    packs = [payload] if isinstance(payload[0], dict) else payload
+    if any(
+        not isinstance(pack, list) or not pack or any(not isinstance(sample, dict) for sample in pack) for pack in packs
+    ):
+        raise ValueError(f"{path} contains an empty or malformed replay pack")
+    return packs
 
 
 def _pack_sample_ids(packs: Sequence[Sequence[Dict]], source: str) -> set:
@@ -351,10 +382,7 @@ def _check_heldout_manifest(
 
 
 def _to_device(batch: Cosmos3PackedBatch, device: torch.device) -> Cosmos3PackedBatch:
-    moved = {
-        name: value.to(device) if isinstance(value, torch.Tensor) else value
-        for name, value in batch.model_inputs.items()
-    }
+    moved = _tree_to_device(batch.model_inputs, device)
     return Cosmos3PackedBatch(
         model_inputs=moved,
         layout=batch.layout,
@@ -363,94 +391,130 @@ def _to_device(batch: Cosmos3PackedBatch, device: torch.device) -> Cosmos3Packed
     )
 
 
+def _tree_to_device(value, device):
+    if isinstance(value, torch.Tensor):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {k: _tree_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_tree_to_device(v, device) for v in value)
+    return value
+
+
+def replay_window(packs, cursor, microsteps, dp_rank, dp_size, mode):
+    """Cursor counts consumed pack slots (global for replicated, local for sharded).
+
+    CP peers share dp_rank and therefore every pack in the window. Each window
+    advances by all microsteps, including when wrapping the replay file.
+    """
+    if mode not in ("replicated", "sharded") or not packs or microsteps <= 0:
+        raise ValueError("Invalid replay mode, empty packs, or nonpositive microsteps")
+    stride = dp_size if mode == "replicated" else 1
+    if mode == "replicated" and len(packs) < dp_size:
+        raise ValueError("replicated replay needs at least one distinct pack per DP rank")
+    offset = dp_rank if mode == "replicated" else 0
+    window = [packs[(cursor + i * stride + offset) % len(packs)] for i in range(microsteps)]
+    return window, cursor + microsteps * stride
+
+
+def _pack_replay_samples(samples):
+    """Targets are recipe metadata, never transformer inputs or packer tensor fields."""
+    return pack_cosmos3_samples(
+        [{key: value for key, value in sample.items() if key not in ("vision_target", "targets")} for sample in samples]
+    )
+
+
+def _sample_targets(sample):
+    targets = sample.get("targets")
+    required = {"vision", "action", "raw_action_dim", "vision_noisy_mask", "action_noisy_mask"}
+    if not isinstance(targets, dict) or not required.issubset(targets):
+        raise ValueError("DROID replay requires complete per-sample targets: " + ", ".join(sorted(required)))
+    return targets
+
+
+def _window_count(window, objective):
+    if objective == "droid":
+        for samples in window:
+            for sample in samples:
+                _sample_targets(sample)
+        return sum(len(samples) for samples in window)
+    if objective != "generic-vision-token-mean":
+        raise ValueError("Choose an explicit loss objective")
+    for samples in window:
+        for sample in samples:
+            if sample.get("action_tokens") or sample.get("sound_tokens"):
+                raise ValueError("generic-vision-token-mean supports vision-only replay; choose droid for actions")
+    return sum(sample["vision_target"].numel() for samples in window for sample in samples)
+
+
 def _loss_for_batch(
     model,
-    batch: Cosmos3PackedBatch,
-    samples: Sequence[Dict],
-    data_parallel_size: int,
-) -> torch.Tensor:
-    """Compute the token-normalised velocity loss for one packed batch.
-
-    The replay pack must carry ``vision_target`` per sample, a list matching the model's ``sample`` output. A full
-    recipe replaces this with its noise/timestep and modality weights; the reduction and metadata binding stay the
-    same.
-    """
+    batch,
+    samples,
+    data_parallel_size,
+    *,
+    objective="generic-vision-token-mean",
+    global_count=None,
+    dp_group=None,
+):
+    """Return this microstep's contribution to the complete accumulation window."""
     device = next(model.parameters()).device
     set_cosmos3_packed_meta(model, batch.meta, strict=True)
     outputs = model(**_to_device(batch, device).model_inputs)
-    modality_losses = []
-    for sample_index, sample in enumerate(samples):
-        target = sample["vision_target"].to(device)
-        prediction = outputs.sample[sample_index]
-        modality_losses.append(velocity_mse(prediction, target))
+    if objective == "droid":
+        from types import SimpleNamespace
 
-    combined = combine_modality_losses([{"sum": sum_loss, "count": count} for sum_loss, count in modality_losses])
-    local_tokens = int(combined["count"])
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        from colossalai.shardformer.modeling.cosmos_mot import all_reduce_supervised_tokens
+        from examples.worldmodel.cosmos3.packing import compute_loss
 
-        global_tokens = all_reduce_supervised_tokens(local_tokens, device=device)
+        if (
+            not outputs.sample
+            or not outputs.action
+            or len(outputs.sample) != len(samples)
+            or len(outputs.action) != len(samples)
+        ):
+            raise ValueError("DROID output must have one vision and action prediction per replay sample")
+        losses = []
+        for i, sample in enumerate(samples):
+            targets = _tree_to_device(_sample_targets(sample), device)
+            # Call the recipe once per sample: no truncation, token weighting or dropped masks.
+            targets = {k: v if k == "raw_action_dim" else [v] for k, v in targets.items()}
+            losses.append(
+                compute_loss(SimpleNamespace(sample=[outputs.sample[i]], action=[outputs.action[i]]), targets)
+            )
+        numerator, local_count = torch.stack(losses).sum(), len(samples)
     else:
-        global_tokens = local_tokens
-    return normalise_packed_loss(combined["sum"], local_tokens, global_tokens, data_parallel_size)
-
-
-def _device_rng_state():
-    """Return the accelerator RNG state, or None when the current accelerator does not expose one (CPU)."""
-    from colossalai.accelerator import get_accelerator
-
-    try:
-        return [state.cpu() for state in get_accelerator().get_rng_state_all()]
-    except (RuntimeError, AttributeError):
-        return None
-
-
-def _save_state(directory: Path, model, optimizer, step: int, epoch: int, sampler_cursor: int) -> None:
-    import torch.distributed as dist
-
-    directory.mkdir(parents=True, exist_ok=True)
-    from colossalai.booster import Booster
-
-    # The booster object is passed through the module attribute set in `train`; saving through it keeps the
-    # checkpoint format consistent with the plugin (sharded model, ZeRO optimizer).
-    booster: Booster = model._colossal_booster
-    booster.save_model(model, str(directory / "model"), shard=True, use_safetensors=True)
-    booster.save_optimizer(optimizer, str(directory / "optimizer"), shard=True)
-    state = {
-        "step": step,
-        "epoch": epoch,
-        "sampler_cursor": sampler_cursor,
-        "torch_rng_state": torch.get_rng_state(),
-        "device_rng_state": _device_rng_state(),
-        "world_size": dist.get_world_size() if dist.is_initialized() else 1,
-    }
-    torch.save(state, directory / "training_state.pt")
-
-
-def _restore_state(directory: Path, model, optimizer) -> Dict:
-    import torch.distributed as dist
-
-    from colossalai.accelerator import get_accelerator
-
-    booster = model._colossal_booster
-    booster.load_model(model, str(directory / "model"))
-    booster.load_optimizer(optimizer, str(directory / "optimizer"))
-    state = torch.load(directory / "training_state.pt", map_location="cpu", weights_only=False)
-    torch.set_rng_state(state["torch_rng_state"])
-    if state.get("device_rng_state") is not None:
-        try:
-            get_accelerator().set_rng_state_all(state["device_rng_state"])
-        except (RuntimeError, AttributeError):
-            # A checkpoint moved from an accelerator host to a CPU-only host has no device RNG to restore.
-            pass
-    if dist.is_initialized() and state.get("world_size") != dist.get_world_size():
-        print(
-            f"warning: resuming a {state.get('world_size')}-rank checkpoint on {dist.get_world_size()} ranks; the "
-            f"model/optimizer shards are reloaded, but step-for-step equivalence is only promised for the same "
-            f"topology.",
-            flush=True,
+        _window_count([samples], objective)
+        combined = combine_modality_losses(
+            [
+                dict(zip(("sum", "count"), velocity_mse(outputs.sample[i], sample["vision_target"].to(device))))
+                for i, sample in enumerate(samples)
+            ]
         )
-    return state
+        numerator, local_count = combined["sum"], combined["count"]
+    if global_count is None:
+        global_count = _global_count(local_count, device, dp_group)
+    return normalise_packed_loss(numerator, local_count, global_count, data_parallel_size)
+
+
+def _global_count(count, device, group=None):
+    value = torch.tensor(count, dtype=torch.int64, device=device)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(value, group=group)
+    return int(value.item())
+
+
+def _save_state(directory, model, optimizer, step, epoch, sampler_cursor, config=None):
+    from examples.worldmodel.cosmos3_harness.checkpoint import save_checkpoint
+
+    save_checkpoint(
+        directory, model, optimizer, {"step": step, "epoch": epoch, "sampler_cursor": sampler_cursor, "config": config}
+    )
+
+
+def _restore_state(directory, model, optimizer, config=None):
+    from examples.worldmodel.cosmos3_harness.checkpoint import restore_checkpoint
+
+    return restore_checkpoint(directory, model, optimizer, expected_config=config)
 
 
 def _write_bench_report(
@@ -481,6 +545,11 @@ def _write_bench_report(
             "zero_stage": args.zero_stage,
             "adamw": args.adamw,
             "learning_rate": args.learning_rate,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "cp_size": args.cp_size,
+            "loss_objective": args.loss_objective,
+            "replay_mode": args.replay_mode,
+            "timing_source": "device_synchronized_wall",
         },
         "step_ms": {
             "median": ordered[len(ordered) // 2] * 1e3,
@@ -502,11 +571,26 @@ def train(args: argparse.Namespace) -> int:
     import torch.distributed as dist
 
     import colossalai
+    from colossalai.accelerator import get_accelerator, set_accelerator
     from colossalai.booster import Booster
     from colossalai.booster.plugin import HybridParallelPlugin
     from colossalai.shardformer.policies.cosmos3 import Cosmos3OmniPolicy
 
-    colossalai.launch_from_torch(config={})
+    if args.device != "auto":
+        set_accelerator(args.device)
+    accelerator = get_accelerator()
+    backend = resolve_backend(args.backend)
+    if backend in ("cuda", "npu") and backend != accelerator.name:
+        raise ValueError("Attention backend must match --device/the detected accelerator")
+    if args.precision != "bf16" or accelerator.name not in ("cuda", "npu"):
+        raise ValueError("Real harness training currently supports BF16 on CUDA/NPU only")
+    if not args.loss_objective or not args.replay_mode:
+        raise ValueError("Real training requires explicit --loss-objective and --replay-mode")
+    import os
+
+    if int(os.environ.get("WORLD_SIZE", "1")) % args.cp_size:
+        raise ValueError("--cp-size must divide WORLD_SIZE")
+    colossalai.launch_from_torch(backend=accelerator.communication_backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     backend = resolve_backend(args.backend)
@@ -520,29 +604,72 @@ def train(args: argparse.Namespace) -> int:
         )
     model = transformer_cls.from_pretrained(args.model, torch_dtype=torch.bfloat16)
     model.train()
-    if hasattr(model, "gradient_checkpointing_enable"):
+    if args.checkpoint_mode == "full" and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
-    policy = Cosmos3OmniPolicy(backend=backend)
+    policy = Cosmos3OmniPolicy(backend=backend, selective_checkpointing=args.checkpoint_mode == "selective")
     plugin = HybridParallelPlugin(
         tp_size=1,
         pp_size=1,
-        sp_size=1,
+        sp_size=args.cp_size,
+        enable_sequence_parallelism=args.cp_size > 1,
+        sequence_parallelism_mode="all_to_all" if args.cp_size > 1 else None,
+        cast_inputs=False,
+        cast_buffers=False,
         precision=args.precision,
         zero_stage=args.zero_stage,
         custom_policy=policy,
         overlap_communication=True,
         max_norm=0.0,
     )
-    optimizer = _build_optimizer(model, args.learning_rate, backend, args.adamw)
+    optimizer = _build_optimizer(model, args.learning_rate, backend, args.adamw, device_type=accelerator.name)
     booster = Booster(plugin=plugin)
     model, optimizer, _, _, _ = booster.boost(model=model, optimizer=optimizer)
     model._colossal_booster = booster
 
     metrics = _build_metrics(args, rank, world_size, next(model.parameters()).device, backend)
 
-    packs = _load_replay_packs(args.replay_pack)
+    dp_rank = dist.get_rank(plugin.dp_group)
+    data_parallel_size = dist.get_world_size(plugin.dp_group)
+    replay_path = args.replay_pack.format(dp_rank=dp_rank)
+    packs = _load_replay_packs(replay_path)
+    from examples.worldmodel.cosmos3_harness.checkpoint import file_digest
+
+    fingerprints = [None] * world_size
+    dist.all_gather_object(fingerprints, file_digest(replay_path))
+    for dp in range(data_parallel_size):
+        if len(set(fingerprints[dp * args.cp_size : (dp + 1) * args.cp_size])) != 1:
+            raise ValueError("CP peers must read identical replay data")
+    if args.replay_mode == "replicated" and len(set(fingerprints)) != 1:
+        raise ValueError("replicated replay requires identical pack files on every rank")
+    if args.replay_mode == "sharded" and len(set(fingerprints[:: args.cp_size])) != data_parallel_size:
+        raise ValueError("sharded replay requires a distinct file per DP rank")
+    config = {
+        k: getattr(args, k)
+        for k in (
+            "loss_objective",
+            "replay_mode",
+            "cp_size",
+            "precision",
+            "zero_stage",
+            "gradient_accumulation_steps",
+            "checkpoint_mode",
+            "model",
+            "adamw",
+            "learning_rate",
+        )
+    }
+    config["attention_backend"] = backend
+    config["replay_fingerprints"] = fingerprints
+    config["heldout_fingerprint"] = file_digest(args.heldout_manifest) if args.heldout_manifest else None
+    _window_count(packs, args.loss_objective)
     eval_packs = _load_replay_packs(args.eval_pack) if args.eval_pack else None
+    eval_fingerprints = [None] * world_size
+    dist.all_gather_object(eval_fingerprints, file_digest(args.eval_pack) if args.eval_pack else None)
+    if len(set(eval_fingerprints)) != 1:
+        raise ValueError("Every rank must use the identical held-out replay file")
+    if eval_packs is not None:
+        _window_count(eval_packs, args.loss_objective)
     if args.heldout_manifest:
         heldout = _check_heldout_manifest(args.heldout_manifest, packs, eval_packs)
         if rank == 0:
@@ -550,28 +677,69 @@ def train(args: argparse.Namespace) -> int:
 
     start_step = 0
     epoch = 0
-    sampler_cursor = 0  # absolute index of the next pack to read; advanced once per step
+    sampler_cursor = 0  # consumed global pack slots (replicated) or local pack slots (sharded)
     if args.resume:
-        state = _restore_state(Path(args.resume), model, optimizer)
+        state = _restore_state(Path(args.resume), model, optimizer, config)
         start_step = int(state["step"])
         epoch = int(state["epoch"])
         sampler_cursor = int(state["sampler_cursor"])
 
-    data_parallel_size = world_size
+    if start_step > args.steps:
+        raise ValueError("--steps is smaller than the checkpoint's completed optimizer steps")
+    count_data = args.cp_size == 1 or dist.get_rank(plugin.sp_group) == 0
+    seen_samples = 0
     begin = time.time()
     step_times: List[float] = []
+    timing_sources = set()
+    last_saved_step = None
     for step in range(start_step, args.steps):
+        measure_device = (
+            bool(args.bench_json)
+            or (step + 1) % args.log_interval == 0
+            or (metrics is not None and (step + 1) % args.metrics_every == 0)
+        )
+        if measure_device:
+            accelerator.synchronize()
         step_start = time.perf_counter()
-        samples = packs[sampler_cursor % len(packs)]
-        sampler_cursor += 1
-        batch = pack_cosmos3_samples(samples)
+        window, next_cursor = replay_window(
+            packs, sampler_cursor, args.gradient_accumulation_steps, dp_rank, data_parallel_size, args.replay_mode
+        )
+        device = next(model.parameters()).device
+        global_count = _global_count(_window_count(window, args.loss_objective), device, plugin.dp_group)
         optimizer.zero_grad(set_to_none=True)
-        loss = _loss_for_batch(model, batch, samples, data_parallel_size)
-        booster.backward(loss, optimizer)
+        loss = torch.zeros((), device=device)
+        batches = []
+        for samples in window:
+            batch = _pack_replay_samples(samples)
+            batches.append(batch)
+            try:
+                micro_loss = _loss_for_batch(
+                    model,
+                    batch,
+                    samples,
+                    data_parallel_size,
+                    objective=args.loss_objective,
+                    global_count=global_count,
+                    dp_group=plugin.dp_group,
+                )
+                booster.backward(micro_loss, optimizer)
+                loss += micro_loss.detach()
+            finally:
+                clear_cosmos3_packed_meta(model, strict=True)
         optimizer.step()
-        clear_cosmos3_packed_meta(model, strict=True)
+        step_dispatch_ms = (time.perf_counter() - step_start) * 1e3
+        if measure_device:
+            accelerator.synchronize()
         step_ms = (time.perf_counter() - step_start) * 1e3
         step_times.append(step_ms / 1e3)
+        timing_sources.add("device_synchronized_wall" if measure_device else "host_dispatch")
+        sampler_cursor = next_cursor
+        epoch = sampler_cursor // len(packs)
+        # Report the actual window objective rather than rank zero's weighted contribution.
+        dist.all_reduce(loss, group=plugin.dp_group)
+        loss /= data_parallel_size
+        sample_count = sum(len(samples) for samples in window)
+        seen_samples += sample_count
 
         log_now = (step + 1) % args.log_interval == 0
         loss_value = float(loss.detach().cpu()) if log_now else None
@@ -582,10 +750,10 @@ def train(args: argparse.Namespace) -> int:
                     {
                         "step": step + 1,
                         "loss": loss_value,
-                        "supervised_tokens": batch.total_supervised_tokens,
-                        "real_tokens": batch.layout.real_tokens,
-                        "pad_tokens": batch.layout.pad_tokens,
-                        "samples_per_second": len(samples) * (step + 1 - start_step) / max(elapsed, 1e-9),
+                        "supervised_tokens": sum(b.total_supervised_tokens for b in batches),
+                        "real_tokens": sum(b.layout.real_tokens for b in batches),
+                        "pad_tokens": sum(b.layout.pad_tokens for b in batches),
+                        "samples_per_second": seen_samples / max(elapsed, 1e-9),
                     }
                 ),
                 flush=True,
@@ -593,15 +761,24 @@ def train(args: argparse.Namespace) -> int:
         if metrics is not None:
             sections = {
                 "data": {
-                    "samples": len(samples),
-                    "supervised_tokens": batch.total_supervised_tokens,
-                    "ar_tokens": batch.meta.total_ar_tokens,
-                    "dm_tokens": batch.meta.total_dm_tokens,
-                    "real_tokens": batch.layout.real_tokens,
-                    "pad_tokens": batch.layout.pad_tokens,
+                    "samples": sample_count,
+                    "supervised_tokens": sum(b.total_supervised_tokens for b in batches),
+                    "ar_tokens": sum(b.meta.total_ar_tokens for b in batches),
+                    "dm_tokens": sum(b.meta.total_dm_tokens for b in batches),
+                    "real_tokens": sum(b.layout.real_tokens for b in batches),
+                    "pad_tokens": sum(b.layout.pad_tokens for b in batches),
                 },
-                "perf": {"step_ms": step_ms},
+                "perf": {
+                    "step_ms": step_ms,
+                    "step_dispatch_ms": step_dispatch_ms,
+                    "timing_sources": {
+                        "step_ms": "device_synchronized_wall" if measure_device else "host_dispatch",
+                        "step_dispatch_ms": "host_dispatch",
+                    },
+                },
             }
+            if not count_data:
+                sections["data"] = {key: 0 for key in sections["data"]}
             if log_now:
                 optim_section = {}
                 getter = getattr(optimizer, "get_grad_norm", None)
@@ -616,7 +793,8 @@ def train(args: argparse.Namespace) -> int:
                 sections["mem"] = device_memory_gib()
             metrics.step(step + 1, **sections)
         if args.save_dir and (step + 1) % args.save_interval == 0:
-            _save_state(Path(args.save_dir), model, optimizer, step + 1, epoch, sampler_cursor)
+            _save_state(Path(args.save_dir), model, optimizer, step + 1, epoch, sampler_cursor, config)
+            last_saved_step = step + 1
 
     if args.bench_json and rank == 0:
         _write_bench_report(
@@ -628,14 +806,20 @@ def train(args: argparse.Namespace) -> int:
             next(model.parameters()).device,
         )
 
-    _save_state(Path(args.save_dir), model, optimizer, args.steps, epoch, sampler_cursor)
+    if last_saved_step != args.steps:
+        _save_state(Path(args.save_dir), model, optimizer, args.steps, epoch, sampler_cursor, config)
 
     if eval_packs is not None:
+        model.eval()
         with torch.no_grad():
             losses = []
             for samples in eval_packs:
-                batch = pack_cosmos3_samples(samples)
-                losses.append(float(_loss_for_batch(model, batch, samples, data_parallel_size).detach().cpu()))
+                batch = _pack_replay_samples(samples)
+                value = _loss_for_batch(
+                    model, batch, samples, data_parallel_size, objective=args.loss_objective, dp_group=plugin.dp_group
+                ).detach()
+                dist.all_reduce(value, group=plugin.dp_group)
+                losses.append(float((value / data_parallel_size).cpu()))
                 clear_cosmos3_packed_meta(model, strict=True)
         if rank == 0:
             print(json.dumps({"heldout_losses": losses}), flush=True)
@@ -650,6 +834,7 @@ def train(args: argparse.Namespace) -> int:
                     "step_ms_median": ordered[len(ordered) // 2] * 1e3,
                     "step_ms_min": ordered[0] * 1e3,
                     "step_ms_mean": sum(timed) / len(timed) * 1e3,
+                    "timing_sources": {"step_ms": next(iter(timing_sources)) if len(timing_sources) == 1 else "mixed"},
                 }
             )
         if eval_packs is not None:

@@ -73,10 +73,12 @@ def test_flatten_names_sections_with_a_slash():
 
 
 def test_aggregate_sums_counts_maximises_durations_and_averages_loss():
-    rank0 = make_record(5, 0, data={"samples": 8, "supervised_tokens": 20000}, loss={"total": 2.0},
-                        perf={"step_ms": 4000})
-    rank1 = make_record(5, 1, data={"samples": 8, "supervised_tokens": 22000}, loss={"total": 4.0},
-                        perf={"step_ms": 5000})
+    rank0 = make_record(
+        5, 0, data={"samples": 8, "supervised_tokens": 20000}, loss={"total": 2.0}, perf={"step_ms": 4000}
+    )
+    rank1 = make_record(
+        5, 1, data={"samples": 8, "supervised_tokens": 22000}, loss={"total": 4.0}, perf={"step_ms": 5000}
+    )
 
     aggregated = aggregate_records([rank0, rank1])
 
@@ -139,8 +141,9 @@ def test_rank_file_reader_returns_events_up_to_the_requested_step(tmp_path):
 
 def test_aggregator_reads_other_ranks_and_skips_missing_files(tmp_path):
     own = make_record(4, 0, data={"samples": 2})
-    (tmp_path / "rank-001.jsonl").write_text(json.dumps(make_record(4, 1, data={"samples": 3})) + "\n",
-                                             encoding="utf-8")
+    (tmp_path / "rank-001.jsonl").write_text(
+        json.dumps(make_record(4, 1, data={"samples": 3})) + "\n", encoding="utf-8"
+    )
 
     aggregator = MetricsAggregator(tmp_path, world_size=3, rank=0)
     records, events = aggregator.collect(4, own_record=own)
@@ -150,8 +153,9 @@ def test_aggregator_reads_other_ranks_and_skips_missing_files(tmp_path):
 
 
 def test_aggregator_forwards_events_written_by_other_ranks(tmp_path):
-    (tmp_path / "rank-001.jsonl").write_text(json.dumps(make_event(3, "nonfinite_loss", "nan", "error")) + "\n",
-                                             encoding="utf-8")
+    (tmp_path / "rank-001.jsonl").write_text(
+        json.dumps(make_event(3, "nonfinite_loss", "nan", "error")) + "\n", encoding="utf-8"
+    )
 
     aggregator = MetricsAggregator(tmp_path, world_size=2, rank=0)
     records, events = aggregator.collect(5, own_record=None)
@@ -201,9 +205,7 @@ def test_detector_flags_step_time_skew_starvation_and_memory_pressure():
 
 def test_training_metrics_writes_manifest_records_and_summary(tmp_path):
     collector = _Collector()
-    metrics = TrainingMetrics(
-        out_dir=tmp_path, rank=0, world_size=1, log_every=2, aggregate_observers=[collector]
-    )
+    metrics = TrainingMetrics(out_dir=tmp_path, rank=0, world_size=1, log_every=2, aggregate_observers=[collector])
     metrics.start({"git_commit": "abc"})
     metrics.step(1, data={"samples": 4}, loss={"total": 1.0}, perf={"step_ms": 100})
     metrics.step(2, data={"samples": 4}, perf={"step_ms": 100})
@@ -321,6 +323,27 @@ def test_stopwatch_falls_back_to_wall_clock_and_is_free_when_disabled():
     with watch.section("skipped"):
         time.sleep(0.01)
     assert watch.read_ms() == {}
+
+
+def test_stopwatch_sums_every_microstep_and_labels_dispatch(monkeypatch):
+    ticks = iter([0.0, 0.010, 0.020, 0.050, 0.060, 0.065])
+    monkeypatch.setattr(
+        sys.modules[Stopwatch.__module__], "time", types.SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
+    watch = Stopwatch(use_events=False)
+    watch.reset()
+    with watch.section("forward"):
+        pass
+    with watch.section("forward"):
+        pass
+    with watch.section("optim"):
+        pass
+    assert watch.read_ms() == pytest.approx({"forward": 40.0, "optim": 5.0})
+    assert watch.read_dispatch_ms() == pytest.approx({"forward": 40.0, "optim": 5.0})
+    assert watch.timing_sources == {"forward": "host_dispatch", "optim": "host_dispatch"}
+    watch.reset()
+    assert watch.read_ms() == {}
+    assert watch.timing_sources == {}
 
 
 def test_jsonl_observer_keeps_events_and_records_in_one_file(tmp_path):

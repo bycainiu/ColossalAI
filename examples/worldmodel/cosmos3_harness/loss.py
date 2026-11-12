@@ -13,7 +13,13 @@ import torch
 
 from colossalai.shardformer.modeling.cosmos_mot import all_reduce_supervised_tokens
 
-__all__ = ["velocity_mse", "normalise_packed_loss", "gather_window_tokens", "combine_modality_losses"]
+__all__ = [
+    "velocity_mse",
+    "normalise_packed_loss",
+    "normalise_vision_token_mean",
+    "gather_window_tokens",
+    "combine_modality_losses",
+]
 
 
 def velocity_mse(prediction: torch.Tensor, target: torch.Tensor, loss_mask: Optional[torch.Tensor] = None):
@@ -88,7 +94,7 @@ def gather_window_tokens(local_tokens: int, group=None, device: Optional[torch.d
     return all_reduce_supervised_tokens(local_tokens, group=group, device=device)
 
 
-def normalise_packed_loss(
+def normalise_vision_token_mean(
     local_sum,
     local_tokens: int,
     global_tokens: int,
@@ -108,6 +114,14 @@ def normalise_packed_loss(
     Returns:
         torch.Tensor: The scalar loss to call ``backward`` on. The value stays attached to ``local_sum``.
     """
+    if min(local_tokens, global_tokens, data_parallel_size) < 0 or data_parallel_size == 0:
+        raise ValueError("Counts must be nonnegative and data_parallel_size positive")
     if local_tokens == 0:
         return local_sum * 0.0
+    if global_tokens <= 0 or global_tokens < local_tokens:
+        raise ValueError("global_tokens must cover the nonempty local loss")
     return local_sum * (data_parallel_size / global_tokens)
+
+
+# Compatibility alias. This reduction is a generic element/token mean, not the DROID objective.
+normalise_packed_loss = normalise_vision_token_mean

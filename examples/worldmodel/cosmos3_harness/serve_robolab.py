@@ -64,7 +64,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--transformer-path", type=Path, help="Consolidated diffusers transformer export from SFT")
     parser.add_argument("--cosmos-root", type=Path, required=True)
-    parser.add_argument("--backend", choices=("naive", "cuda", "npu"), required=True)
+    parser.add_argument("--backend", "--attn-backend", choices=("naive", "cuda", "npu"), required=True)
     parser.add_argument("--device", required=True, help="For example cuda:0 or npu:0")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
